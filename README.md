@@ -21,6 +21,13 @@ Some devices — including the **Autel KM100** — connect over **MTP/PTP (Windo
 - Because MTP has no drive letter, the speed test uses a **copy-based benchmark** — it times a real file **push (write)** to the device and **pull (read)** back through Explorer's WPD copy engine, reporting the practical MTP transfer rate. Read-only MTP roots report the pull figure only.
 - MTP transfer is inherently slower than raw mass storage; the Speed Grade tile does **not** flag a low MTP rate as a bad cable.
 
+### Automatic connect / disconnect detection
+- The app watches continuously and reacts the moment a cable/device is **plugged in or removed** — no manual rescan needed.
+- **Two WMI event triggers** run together: `Win32_VolumeChangeEvent` (drive-letter mass storage) **and** `Win32_DeviceChangeEvent` (non-volume USB arrivals/removals such as the MTP KM100, phones, and cameras that never get a drive letter).
+- A **guaranteed periodic re-scan (~2s)** runs alongside the event watchers, so MTP/WPD devices that raise no watcher event on some systems are still picked up promptly.
+- Each cycle diffs the whole device set (volumes + MTP/PTP) and reports explicit **`connected`** / **`disconnected`** lists in the payload.
+- On connect/disconnect the GUI **logs the exact device**, **flashes the banner** (green pulse for connect, red for disconnect), and **chimes** (respecting the Chime toggle). The startup snapshot is silent — already-plugged devices aren't reported as fresh connects.
+
 ### Detection & accuracy
 - Per-port USB **generation label** (USB 2.0 / 3.x / 3.2 Gen2 / USB4·Thunderbolt) via WMI
 - **Far-end device readout**: name + VID/PID
@@ -39,7 +46,7 @@ Some devices — including the **Autel KM100** — connect over **MTP/PTP (Windo
 - Your selection is preserved across re-detection (stable device keys); Batch Mode clears it so the next cable is auto-selected.
 
 ### Robustness & UX
-- Detection fallback chain: WMI `Win32_VolumeChangeEvent` → `psutil` polling → manual **Rescan**
+- Detection chain: WMI `Win32_VolumeChangeEvent` + `Win32_DeviceChangeEvent` event triggers, a guaranteed ~2s periodic re-scan, `psutil` polling fallback, and a manual **Rescan** button
 - **Auto-relaunch-as-admin** with amber banner when elevation is missing
 - **History table** (timestamp, verdict, speeds) + **CSV export**
 - **Dark/Light theme** toggle; remembers window size/position (`usb_c_tester_config.json`)
@@ -85,7 +92,7 @@ A **GitHub Actions** workflow (`.github/workflows/build.yml`) auto-builds `dist/
 ## Usage
 
 1. Launch the app (run as admin for full WMI USB event access).
-2. Plug a USB-C cable with a **data device** on the far end.
+2. Plug a USB-C cable with a **data device** on the far end — the app **auto-detects the connection** (banner flashes green + chime) and **auto-detects removal** (banner flashes red).
 3. Watch the tiles: green = data-capable, red = charge-only, amber = inconclusive.
 4. Click **Run Benchmark** to measure read/write speed.
 5. Use **Batch Mode** to test multiple cables in sequence; **Export CSV** for records.

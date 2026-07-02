@@ -215,12 +215,21 @@ def save_config(cfg):
 class DetectionEngine(threading.Thread):
     """Watches for volume/USB changes and reports events onto a queue."""
 
+    # How often to force a full re-scan (MTP + volumes) even when no volume
+    # event fires. MTP/WPD devices (KM100, phones) never raise
+    # Win32_VolumeChangeEvent, so without this they'd only be seen on startup
+    # or a manual rescan. 2s keeps connect/disconnect feeling instant.
+    POLL_INTERVAL = 2.0
+
     def __init__(self, out_queue, logger):
         super().__init__(daemon=True)
         self.q = out_queue
         self.log = logger
         self._stop = threading.Event()
-        self._known = set()
+        self._known = set()          # removable volume device keys
+        self._known_mtp = tuple()    # sorted MTP/PTP device-name signature
+        # Human-readable label per device key, for connect/disconnect logging.
+        self._known_labels = {}
 
     def stop(self):
         self._stop.set()
@@ -439,18 +448,32 @@ class DetectionEngine(threading.Thread):
         return tuple(sorted(d["name"] for d in mtp_devices))
 
     def run(self):
-        self._known = set(self.snapshot_volumes().keys())
-        self._known_mtp = self._mtp_signature(self.enumerate_mtp())
-        self.log.event("INFO", "detection_started", {"known_volumes": list(self._known)})
+        # Seed known state WITHOUT emitting so the first _diff_and_emit(force)
+        # reports everything already present as an initial "connected" set.
+        self._known = set()
+        self._known_mtp = tuple()
+        self._known_labels = {}
+        self.log.event("INFO", "detection_started")
         use_wmi = wmi is not None
-        watcher = None
+        vol_watcher = None
+        dev_watcher = None
         if use_wmi:
             try:
                 import pythoncom
 
                 pythoncom.CoInitialize()
                 c = wmi.WMI()
-                watcher = c.Win32_VolumeChangeEvent.watch_for()
+                # Volume events fire for drive-letter (mass-storage) changes.
+                vol_watcher = c.Win32_VolumeChangeEvent.watch_for()
+                # Device events ALSO fire for non-volume USB arrivals/removals
+                # (MTP/WPD devices such as the KM100, phones, cameras), giving
+                # us a fast trigger the volume watcher never sees.
+                try:
+                    dev_watcher = c.Win32_DeviceChangeEvent.watch_for()
+                    self.log.event("INFO", "wmi_device_watcher_active")
+                except Exception as de:
+                    self.log.exc("wmi_device_watch_init", de)
+                    dev_watcher = None
                 self.log.event("INFO", "wmi_watcher_active")
             except Exception as e:
                 self.log.exc("wmi_watch_init", e)
@@ -460,28 +483,45 @@ class DetectionEngine(threading.Thread):
         self._diff_and_emit(force=True)
         timed_out_exc = getattr(wmi, "x_wmi_timed_out", None) if wmi else None
 
+        def _is_timeout(exc):
+            if timed_out_exc and isinstance(exc, timed_out_exc):
+                return True
+            return "timed_out" in type(exc).__name__.lower()
+
+        last_poll = 0.0
         while not self._stop.is_set():
             try:
-                if use_wmi and watcher is not None:
+                if use_wmi and vol_watcher is not None:
+                    event_seen = False
+                    # Fast USB device-change trigger (MTP arrivals/removals).
+                    if dev_watcher is not None:
+                        try:
+                            if dev_watcher(timeout_ms=200) is not None:
+                                event_seen = True
+                        except Exception as we:
+                            if not _is_timeout(we):
+                                raise
+                    # Volume-change trigger (mass-storage drive letters).
                     try:
-                        evt = watcher(timeout_ms=1500)
-                        if evt is not None:
-                            self._diff_and_emit()
+                        if vol_watcher(timeout_ms=500) is not None:
+                            event_seen = True
                     except Exception as we:
-                        # WMI raises a timeout exception when no event arrives
-                        # within timeout_ms; that is normal -- keep looping.
-                        if timed_out_exc and isinstance(we, timed_out_exc):
-                            pass
-                        elif "timed_out" in type(we).__name__.lower():
-                            pass
-                        else:
+                        if not _is_timeout(we):
                             raise
+
+                    now = time.time()
+                    # Emit on any event, OR on the guaranteed periodic re-scan
+                    # so MTP/WPD devices (invisible to both watchers on some
+                    # systems) are still picked up within POLL_INTERVAL.
+                    if event_seen or (now - last_poll) >= self.POLL_INTERVAL:
+                        self._diff_and_emit()
+                        last_poll = now
                 else:
                     self._diff_and_emit()
-                    time.sleep(2.0)
+                    time.sleep(self.POLL_INTERVAL)
             except Exception as e:
                 self.log.exc("detection_loop", e)
-                time.sleep(2.0)
+                time.sleep(self.POLL_INTERVAL)
 
         if use_wmi:
             try:
@@ -505,23 +545,46 @@ class DetectionEngine(threading.Thread):
         # MTP/WPD devices (KM100, phones, cameras) also count as a change.
         mtp_devices = self.enumerate_mtp()
         mtp_sig = self._mtp_signature(mtp_devices)
-        mtp_changed = mtp_sig != getattr(self, "_known_mtp", tuple())
+        mtp_changed = mtp_sig != self._known_mtp
         self._known_mtp = mtp_sig
+
+        # Build a unified {key: label} map of everything currently present so
+        # we can diff the whole device set (volumes + MTP/PTP) and report
+        # explicit connect/disconnect events, not just volume-letter changes.
+        cur_labels = {}
+        for dev, mp in current.items():
+            cur_labels["vol:" + str(dev)] = "USB Storage \u2014 {} ({})".format(mp, dev)
+        for m in mtp_devices:
+            tag = "MTP" if m.get("type") == "MTP" else "PTP/camera"
+            cur_labels["mtp:" + m["name"]] = "{} ({})".format(m["name"], tag)
+
+        prev_labels = self._known_labels
+        connected_keys = set(cur_labels) - set(prev_labels)
+        disconnected_keys = set(prev_labels) - set(cur_labels)
+        connected = [cur_labels[k] for k in sorted(connected_keys)]
+        disconnected = [prev_labels[k] for k in sorted(disconnected_keys)]
+        self._known_labels = cur_labels
 
         # Emit only on an actual change or an explicit force (initial/rescan).
         # Never emit repeatedly just because nothing is present -- that would
         # flood the queue and re-run WMI/WPD every poll cycle.
-        if force or added or removed or mtp_changed:
+        if force or added or removed or mtp_changed or connected or disconnected:
             usb = self.enumerate_usb()
             payload = {
                 "volumes": current,
                 "added": list(added),
                 "removed": list(removed),
+                "connected": connected,
+                "disconnected": disconnected,
                 "usb_devices": usb,
                 "mtp_devices": mtp_devices,
                 "generation": self.usb_generation(),
                 "pd_voltage": self.pd_wattage(),
             }
+            if connected:
+                self.log.event("INFO", "device_connected", {"devices": connected})
+            if disconnected:
+                self.log.event("INFO", "device_disconnected", {"devices": disconnected})
             self.q.put(payload)
 
 
@@ -827,6 +890,7 @@ class App(ctk.CTk):
         self.data_capable = False
         self.mtp_target = None  # name of connected MTP device (e.g. KM100)
         self.last_payload = {}
+        self._first_detection = True  # suppress flash/chime for startup state
         self.tray = None
 
         ctk.set_appearance_mode(cfg.get("theme", "Dark"))
@@ -1011,6 +1075,22 @@ class App(ctk.CTk):
             except Exception:
                 pass
 
+    def _flash_banner(self, state, times=4, interval=140):
+        """Briefly pulse the banner to a highlight color to draw the eye to a
+        connect/disconnect event, then let the next detection restore it."""
+        hi = COLOR.get(state + "_hi", COLOR.get(state, COLOR["idle"]))
+        base = COLOR.get(state, COLOR["idle"])
+
+        def step(n):
+            try:
+                self.banner.configure(fg_color=hi if n % 2 == 0 else base)
+            except Exception:
+                return
+            if n > 0:
+                self.after(interval, lambda: step(n - 1))
+
+        step(times)
+
     # -- detection lifecycle -------------------------------------------------
     def _start_detection(self):
         self.detector = DetectionEngine(self.q, self.log)
@@ -1117,10 +1197,26 @@ class App(ctk.CTk):
         self.lbl_gen.configure(text=f"USB generation: {gen}")
         self.lbl_pd.configure(text=f"PD voltage: {pdv if pdv else '\u2014'} V")
 
-        if p.get("added"):
-            self._log_ui(f"Volume added: {p['added']}")
-        if p.get("removed"):
-            self._log_ui(f"Volume removed: {p['removed']}")
+        # Explicit connect / disconnect events (unified: volumes + MTP/PTP).
+        # These flash the banner and chime so a plug/unplug is obvious even
+        # when the user isn't watching the tiles.
+        connected = p.get("connected", [])
+        disconnected = p.get("disconnected", [])
+        for lbl in connected:
+            self._log_ui(f"Connected: {lbl}")
+        for lbl in disconnected:
+            self._log_ui(f"Disconnected: {lbl}")
+        # Skip the flash/chime for the initial startup snapshot -- those
+        # devices were already plugged in, not freshly connected.
+        if self._first_detection:
+            self._first_detection = False
+        elif connected:
+            self._flash_banner("green")
+            self._chime(True)
+        elif disconnected:
+            # Only chime a disconnect if nothing new arrived in the same cycle.
+            self._flash_banner("red")
+            self._chime(False)
 
         # Update tiles/banner/benchmark target for the selected device.
         self._reflect_selection()
