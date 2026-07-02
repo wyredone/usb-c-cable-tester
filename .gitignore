@@ -1,0 +1,26 @@
+# Logs
+logs/
+*.log
+*.jsonl
+
+# App runtime files
+usb_c_tester_config.json
+usb_c_tester_history.csv
+*.tmp
+
+# PyInstaller
+build/
+dist/
+*.manifest
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# OS
+Thumbs.db
+Desktop.ini
