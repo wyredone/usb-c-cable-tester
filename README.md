@@ -14,8 +14,10 @@ A Windows 10/11 desktop app that infers whether a connected USB-C cable supports
 - **LED-style banner** + **color-matched tray icon**
 - Toggleable **audible pass/fail chime**
 
-### MTP / PTP device support (Autel KM100, phones, cameras)
-Some devices — including the **Autel KM100** — connect over **MTP/PTP (Windows Portable Devices)** instead of USB Mass Storage, so they show up like a phone or camera and never get a drive letter. The app detects these through the **WPD shell namespace**:
+### MTP / PTP device support (Autel KM100, Rockchip tools, phones, cameras)
+Some devices — including the **Autel KM100** and **Rockchip-based tools** (VID_2207) — connect over **MTP/PTP (Windows Portable Devices)** instead of USB Mass Storage, so they show up like a phone or camera and never get a drive letter. The app detects these through the **WPD shell namespace**:
+- Devices are identified by the shell **Type column** (`Portable Device` / `Camera` / `Mobile Phone`, etc.), so DLNA/UPnP **media servers** (Sonos, NAS), redirected **user folders** (Downloads, Pictures), and **network/local drives** are correctly excluded. A USB shell path (`usb#vid_...`) is a fallback trigger when the Type column is blank.
+- A device is treated as **MTP** whenever its content tree is browsable — even if the root is empty or lazily populated (common on Rockchip devices) — instead of requiring visible files. Its **VID/PID** is parsed from the shell path.
 - If a device enumerates over **MTP** (browsable content tree), that alone proves the **cable carries data** → Data Capable = green "Data OK (MTP)".
 - **PTP/camera mode** (no browsable storage) → amber: the cable works, but switch the device to **MTP / File Transfer** mode for file access.
 - Because MTP has no drive letter, the speed test uses a **copy-based benchmark** — it times a real file **push (write)** to the device and **pull (read)** back through Explorer's WPD copy engine, reporting the practical MTP transfer rate. Read-only MTP roots report the pull figure only.

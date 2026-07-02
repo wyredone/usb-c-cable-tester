@@ -381,16 +381,46 @@ class DetectionEngine(threading.Thread):
                 pass
         return None
 
+    # Shell "type" strings (GetDetailsOf column 1) that identify a real
+    # portable/USB device. Everything else in "This PC" -- System Folder
+    # (redirected user folders), Media Server (DLNA/Sonos/NAS), Local Disk,
+    # Network Drive -- is NOT a cable-attached device and must be excluded.
+    PORTABLE_TYPES = ("portable device", "portable media player", "camera",
+                      "scanner", "mobile phone")
+
+    @staticmethod
+    def _vidpid_from_path(path):
+        """Pull VID/PID out of a WPD shell path like ...usb#vid_2207&pid_0001#..."""
+        vid = pid = None
+        up = (path or "").upper()
+        if "VID_" in up:
+            try:
+                vid = up.split("VID_")[1][:4]
+            except Exception:
+                pass
+        if "PID_" in up:
+            try:
+                pid = up.split("PID_")[1][:4]
+            except Exception:
+                pass
+        return vid, pid
+
     def enumerate_mtp(self):
         """Enumerate MTP/PTP (Windows Portable Devices) via the Shell namespace.
 
-        MTP/PTP devices (phones, cameras, and the Autel KM100) never receive a
-        drive letter -- Windows exposes them through the WPD shell namespace
-        instead, so psutil / Win32_VolumeChangeEvent cannot see them. This walks
-        "This PC" and returns any portable-device nodes. The fact that a device
-        enumerates over MTP at all proves the cable carries data.
+        MTP/PTP devices (phones, cameras, the Autel KM100, Rockchip tools) never
+        receive a drive letter -- Windows exposes them through the WPD shell
+        namespace instead, so psutil / Win32_VolumeChangeEvent cannot see them.
+        This walks "This PC" and returns portable-device nodes. A device
+        enumerating over MTP at all proves the cable carries data.
 
-        Returns a list of dicts: {name, type, shell_path}.
+        Identification uses the shell TYPE column (GetDetailsOf col 1), which
+        reads e.g. 'Portable Device' for a phone/KM100/Rockchip and 'Media
+        Server' / 'System Folder' / 'Local Disk' for things we must ignore.
+        Relying on 'no drive letter' alone wrongly grabbed DLNA media servers
+        (Sonos/NAS) and redirected user folders (Downloads, Pictures).
+
+        Returns a list of dicts: {name, type, shell_path, vid, pid}.
         type is 'MTP' when the device exposes a browsable content tree, else
         'PTP' (camera-style, image-only / no browsable storage).
         """
@@ -407,29 +437,56 @@ class DetectionEngine(threading.Thread):
                 return devices
             for item in this_pc.Items():
                 try:
-                    is_folder = bool(getattr(item, "IsFolder", False))
-                    # Drives report a filesystem path (e.g. 'C:\\'); portable
-                    # devices report a shell path with no drive letter.
                     path = getattr(item, "Path", "") or ""
-                    has_drive_letter = len(path) >= 2 and path[1] == ":"
+                    # A real drive is "<letter>:..." -- path[0] must be a
+                    # letter. WPD shell paths start "::{GUID}..." whose
+                    # path[1] is also ":", so checking path[1] alone wrongly
+                    # excluded portable devices (e.g. Rockchip sm2031).
+                    has_drive_letter = (len(path) >= 2 and path[1] == ":"
+                                        and path[0].isalpha())
                     if has_drive_letter:
                         continue  # mass-storage volume -- handled elsewhere
-                    if not is_folder:
-                        continue
+
+                    # Authoritative filter: the shell TYPE column.
+                    type_str = ""
+                    try:
+                        type_str = (this_pc.GetDetailsOf(item, 1) or "").strip()
+                    except Exception:
+                        type_str = ""
+                    tl = type_str.lower()
+                    is_portable = any(t in tl for t in self.PORTABLE_TYPES)
+                    # Fallback: a WPD/USB shell path is a portable device even if
+                    # the type column is blank on some Windows builds.
+                    if not is_portable:
+                        pl = path.lower()
+                        if "usb#vid_" in pl or "wpdbusenum" in pl:
+                            is_portable = True
+                    if not is_portable:
+                        continue  # media server / system folder / network -- skip
+
                     name = getattr(item, "Name", "Portable Device")
-                    # If it has browsable child content -> MTP; else PTP-camera.
-                    # MTP => device exposes a browsable content tree with at
-                    # least one storage node. PTP/camera => no browsable
-                    # storage (empty or inaccessible folder).
+                    vid, pid = self._vidpid_from_path(path)
+
+                    # MTP vs PTP: a device that exposes a browsable content tree
+                    # is MTP. Do NOT require populated content -- many devices
+                    # (Rockchip, some phones) report an empty/lazy root until
+                    # opened, yet are fully browsable = MTP. Only a device whose
+                    # folder cannot be obtained at all is treated as PTP/camera.
                     dev_type = "PTP"
                     try:
                         folder = item.GetFolder
-                        if folder is not None and folder.Items().Count > 0:
+                        if folder is not None:
                             dev_type = "MTP"
                     except Exception:
                         dev_type = "PTP"
                     devices.append(
-                        {"name": name, "type": dev_type, "shell_path": path}
+                        {
+                            "name": name,
+                            "type": dev_type,
+                            "shell_path": path,
+                            "vid": vid,
+                            "pid": pid,
+                        }
                     )
                 except Exception as e:
                     self.log.exc("enumerate_mtp_item", e)
