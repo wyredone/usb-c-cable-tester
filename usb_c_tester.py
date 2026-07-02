@@ -798,48 +798,88 @@ class Benchmark:
             pass
         return device_folder, "<root>"
 
-    def _resolve_mtp_write_folder(self, device_folder):
-        """Pick a folder on the device most likely to accept a test write.
-
-        Descends into the storage root, then prefers a standard user folder
-        (Download/Pictures/DCIM/...). Falls back to the storage root, then the
-        device root. Returns (folder, human_path).
+    def _mtp_write_candidates(self, device_folder):
+        """Return an ORDERED list of (folder, human_path) candidates to try a
+        test write into, best first. Android/Autel devices reject writes in
+        some folders and accept them in others, so run_mtp walks this list
+        until one actually accepts the file rather than trusting a single pick.
         """
         storage, _ = self._mtp_first_storage(device_folder)
-        # Look for a preferred writable user folder inside storage.
+        candidates = []
+        seen = set()
+
+        def _add(folder, label):
+            if folder is None:
+                return
+            key = id(folder)
+            if key in seen:
+                return
+            seen.add(key)
+            candidates.append((folder, label))
+
+        # Preferred user folders inside storage, in priority order.
         try:
-            items = storage.Items()
             names = {}
-            for it in items:
+            for it in storage.Items():
                 try:
                     if getattr(it, "IsFolder", False):
-                        names[getattr(it, "Name", "")] = it
+                        names[getattr(it, "Name", "").strip()] = it
                 except Exception:
                     pass
             for want in self.MTP_WRITE_DIRS:
-                for nm, it in names.items():
-                    if nm.strip() == want:
+                it = names.get(want)
+                if it is not None:
+                    try:
                         sub = it.GetFolder
                         if sub is not None:
-                            return sub, want
+                            _add(sub, want)
+                    except Exception:
+                        pass
         except Exception:
             pass
+
+        # Then the storage root itself, then the device root, as last resorts.
+        _add(storage, "storage root")
+        _add(device_folder, "device root")
+        return candidates
+
+    def _resolve_mtp_write_folder(self, device_folder):
+        """Backward-compatible single-pick helper: returns the first write
+        candidate (folder, human_path).
+        """
+        cands = self._mtp_write_candidates(device_folder)
+        if cands:
+            return cands[0]
+        storage, _ = self._mtp_first_storage(device_folder)
         return storage, "storage root"
 
-    def _find_existing_file(self, folder, deadline, min_bytes=256 * 1024,
-                            max_bytes=64 * 1024 * 1024, depth=0, maxdepth=3):
-        """Depth-first search for an existing readable file on the device to
-        use for a pull-only (read) benchmark when writes are refused.
+    # Ideal size band for a pull-only read benchmark: big enough to time
+    # accurately, small enough to finish fast.
+    MTP_READ_MIN_BYTES = 1 * 1024 * 1024        # 1 MB
+    MTP_READ_MAX_BYTES = 128 * 1024 * 1024      # 128 MB
 
-        Prefers a file in a reasonable size band so the read is measurable but
-        quick. Returns the shell item or None.
+    def _find_existing_file(self, folder, deadline, depth=0, maxdepth=4,
+                            _best=None):
+        """Depth-first search for the BEST existing readable file on the device
+        for a pull-only (read) benchmark when writes are refused.
+
+        MTP frequently reports Size==0 for uncached entries, and tiny files
+        (e.g. a '.config') read in well under the timer resolution and produce
+        a bogus 0 MB/s. So instead of returning the first file we see, we scan
+        the tree and keep the LARGEST file, strongly preferring one inside the
+        ideal size band. Returns the best shell item found, or None.
+
+        _best is an internal [item, size, in_band] accumulator shared across
+        the recursion.
         """
+        if _best is None:
+            _best = [None, -1, False]
         if time.time() > deadline or depth > maxdepth:
-            return None
+            return _best[0]
         try:
             items = folder.Items()
         except Exception:
-            return None
+            return _best[0]
         subfolders = []
         for it in items:
             if time.time() > deadline:
@@ -848,15 +888,30 @@ class Benchmark:
                 if getattr(it, "IsFolder", False):
                     subfolders.append(it)
                     continue
-                # A file: accept the first one in the size band if we can size
-                # it; otherwise accept any file as a last resort.
                 sz = 0
                 try:
                     sz = int(getattr(it, "Size", 0) or 0)
                 except Exception:
                     sz = 0
-                if sz == 0 or (min_bytes <= sz <= max_bytes):
-                    return it
+                in_band = self.MTP_READ_MIN_BYTES <= sz <= self.MTP_READ_MAX_BYTES
+                # Ranking: an in-band file always beats a not-in-band file;
+                # within the same class, bigger (capped at max) is better. A
+                # size-0/unknown file is only a last resort.
+                better = False
+                cand_sz = sz
+                if in_band and not _best[2]:
+                    better = True
+                elif in_band and _best[2] and sz > _best[1]:
+                    better = True
+                elif (not in_band) and (not _best[2]):
+                    cand_sz = sz if sz <= self.MTP_READ_MAX_BYTES else 0
+                    if cand_sz > _best[1]:
+                        better = True
+                if better:
+                    _best[0], _best[1], _best[2] = it, cand_sz, in_band
+                # Early exit: a solidly in-band file is good enough.
+                if in_band:
+                    return _best[0]
             except Exception:
                 continue
         for sf in subfolders:
@@ -865,15 +920,13 @@ class Benchmark:
             try:
                 child = sf.GetFolder
                 if child is not None:
-                    found = self._find_existing_file(
-                        child, deadline, min_bytes, max_bytes,
-                        depth + 1, maxdepth
-                    )
-                    if found is not None:
-                        return found
+                    self._find_existing_file(child, deadline, depth + 1,
+                                             maxdepth, _best)
+                    if _best[2]:   # found an in-band file somewhere below
+                        return _best[0]
             except Exception:
                 continue
-        return None
+        return _best[0]
 
     def run_mtp(self, mtp_name, target_mb, progress_cb):
         """Copy-based transfer benchmark for an MTP device (Autel/Rockchip,
@@ -919,48 +972,64 @@ class Benchmark:
                 return result
 
             device_folder = device_item.GetFolder
-            write_folder, write_path = self._resolve_mtp_write_folder(device_folder)
-            result["target_path"] = write_path
+            candidates = self._mtp_write_candidates(device_folder)
+            if not candidates:
+                storage, _ = self._mtp_first_storage(device_folder)
+                candidates = [(storage, "storage root")]
+            result["target_path"] = candidates[0][1]
 
             progress_cb("Preparing MTP test file...")
             with open(local_tmp, "wb") as f:
                 f.write(os.urandom(size_mb * 1024 * 1024))
             pushed_name = os.path.basename(local_tmp)
-
-            progress_cb(f"MTP push (write) to '{write_path}'...")
             src_folder = shell.NameSpace(os.path.dirname(local_tmp))
             src_item = src_folder.ParseName(pushed_name)
-            t0 = time.time()
+
             write_mbps = 0
-            # Bound the write-appearance wait so a refusing device does NOT burn
-            # the whole budget -- we must leave time for the read-only fallback.
-            write_deadline = min(deadline, t0 + self.MTP_WRITE_WAIT_S)
-            try:
-                write_folder.CopyHere(src_item, FLAGS)
-                appeared = False
-                while time.time() < write_deadline:
-                    try:
-                        if write_folder.ParseName(pushed_name) is not None:
-                            appeared = True
-                            break
-                    except Exception:
-                        pass
-                    time.sleep(0.3)
-                wt = time.time() - t0
-                if appeared and wt > 0:
-                    write_mbps = size_mb / wt
-                else:
-                    result["write_note"] = (
-                        "Device refused the write to '%s' -- trying read-only."
-                        % write_path
-                    )
-            except Exception as e:
-                result["write_note"] = "Write not supported: " + str(e)
+            # Try each candidate folder until one actually ACCEPTS the write.
+            # Give each candidate a slice of the budget so a stubborn folder
+            # doesn't starve the read-only fallback. The last candidate gets
+            # whatever is left.
+            n = len(candidates)
+            per = max(3.0, self.MTP_WRITE_WAIT_S / n)
+            tried = []
+            for idx, (cand_folder, cand_path) in enumerate(candidates):
+                progress_cb(f"MTP push (write) to '{cand_path}'...")
+                t0 = time.time()
+                cand_deadline = min(deadline - 6.0, t0 + per)
+                try:
+                    cand_folder.CopyHere(src_item, FLAGS)
+                    appeared = False
+                    while time.time() < cand_deadline:
+                        try:
+                            if cand_folder.ParseName(pushed_name) is not None:
+                                appeared = True
+                                break
+                        except Exception:
+                            pass
+                        time.sleep(0.25)
+                    wt = time.time() - t0
+                    if appeared and wt > 0:
+                        write_mbps = size_mb / wt
+                        write_folder = cand_folder
+                        result["target_path"] = cand_path
+                        break
+                    tried.append(cand_path)
+                except Exception as e:
+                    tried.append(f"{cand_path} ({e})")
+                if time.time() > deadline - 6.0:
+                    break
+            if write_mbps == 0:
+                result["write_note"] = (
+                    "Device refused the write (tried: %s) -- trying read-only."
+                    % ", ".join(tried[:5])
+                )
 
             # --- Pull (read) ---
             progress_cb("MTP pull (read) in progress...")
             read_mbps = 0
             read_note = None
+            read_confirmed = False   # True if ANY bytes were pulled back
             pull_dir = tempfile.mkdtemp(prefix="usb_mtp_pull_")
             dst_folder = shell.NameSpace(pull_dir)
 
@@ -992,20 +1061,45 @@ class Benchmark:
                 t0 = time.time()
                 dst_folder.CopyHere(src_on_device, FLAGS)
                 pulled = os.path.join(pull_dir, pulled_name)
+                # Poll finely and wait for the local file size to STABILISE
+                # (two identical reads) or hit the expected size, so small/fast
+                # copies still get an accurate elapsed time.
+                last_sz = -1
+                stable = 0
+                got_bytes = 0
                 while time.time() < deadline:
                     if os.path.exists(pulled):
-                        # If we know the expected size, wait for it; else accept
-                        # presence + stable size.
-                        if expected_mb is None:
-                            time.sleep(0.4)
+                        cur = os.path.getsize(pulled)
+                        if expected_mb is not None and \
+                                cur >= expected_mb * 1024 * 1024 * 0.98:
+                            got_bytes = cur
                             break
-                        if os.path.getsize(pulled) >= expected_mb * 1024 * 1024 * 0.98:
-                            break
-                    time.sleep(0.3)
+                        if cur > 0 and cur == last_sz:
+                            stable += 1
+                            if stable >= 2:   # size held across polls -> done
+                                got_bytes = cur
+                                break
+                        else:
+                            stable = 0
+                        last_sz = cur
+                    time.sleep(0.05)
                 rt = time.time() - t0
-                if rt > 0 and os.path.exists(pulled):
-                    got_mb = os.path.getsize(pulled) / (1024 * 1024)
-                    read_mbps = got_mb / rt if got_mb > 0 else 0
+                if got_bytes == 0 and os.path.exists(pulled):
+                    got_bytes = os.path.getsize(pulled)
+                got_mb = got_bytes / (1024 * 1024)
+                # A file smaller than ~0.5 MB copies faster than we can time
+                # reliably; report it honestly instead of a bogus 0/near-0.
+                if got_bytes:
+                    read_confirmed = True
+                if got_bytes and got_bytes < 512 * 1024:
+                    read_mbps = 0
+                    read_note = (
+                        (read_note or "") +
+                        " File too small (%.0f KB) to measure read speed "
+                        "reliably; data path confirmed." % (got_bytes / 1024.0)
+                    ).strip()
+                elif rt > 0 and got_mb > 0:
+                    read_mbps = got_mb / rt
                 try:
                     if os.path.exists(pulled):
                         os.remove(pulled)
@@ -1023,11 +1117,21 @@ class Benchmark:
             result["read"] = {"min": read_mbps, "avg": read_mbps, "max": read_mbps}
             result["rand4k"] = {"min": 0, "avg": 0, "max": 0}
             result["anomaly"] = None
+            result["read_confirmed"] = read_confirmed
             if write_mbps == 0 and read_mbps == 0:
-                result["error"] = (
-                    "MTP throughput not measurable (device refused writes and no "
-                    "readable file found). Cable is still confirmed data-capable."
-                )
+                if read_confirmed:
+                    # We DID move data (a small file), just couldn't time it.
+                    result["note"] = (
+                        "MTP data transfer confirmed, but the available file was "
+                        "too small to measure a reliable speed. Cable is "
+                        "data-capable."
+                    )
+                else:
+                    result["error"] = (
+                        "MTP throughput not measurable (device refused writes and "
+                        "no readable file found). Cable is still confirmed "
+                        "data-capable."
+                    )
             self.log.event("INFO", "benchmark_mtp_complete", result)
             return result
         except Exception as e:
@@ -1549,6 +1653,19 @@ class App(ctk.CTk):
                 self._log_ui(res["write_note"])
             if res.get("read_note"):
                 self._log_ui(res["read_note"])
+            if res.get("note"):
+                self._log_ui(res["note"])
+            # Data confirmed but not timeable (e.g. only a tiny file to pull).
+            if w == 0 and r == 0 and res.get("read_confirmed"):
+                verdict = "Data OK (MTP, confirmed)"
+                self.tile_speed.set("green", "MTP data OK")
+                self.btn_bench.configure(state="normal", fg_color=COLOR["green"], text="Run Benchmark")
+                self._log_ui("MTP data transfer confirmed (speed not measurable).")
+                self._chime(True)
+                row = (stamp_line(), verdict, gen, "n/a", "n/a", "n/a")
+                self.tree.insert("", 0, values=row)
+                self._append_history(row)
+                return
             # Pull-only fallback: write refused but read measured.
             if w == 0 and r > 0:
                 verdict = "Data OK (MTP, read-only)"
