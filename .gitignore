@@ -29,3 +29,4 @@ Desktop.ini
 test_harness.py
 mtp_tests.py
 mtp_method.txt
+picker_tests.py

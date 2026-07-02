@@ -33,6 +33,11 @@ Some devices — including the **Autel KM100** — connect over **MTP/PTP (Windo
 - **Auto-scales** test file to free space, **capped ~10s** so it never hangs
 - Flags **throttling anomaly** if mid-test speed drops >20%
 
+### Device selection
+- **Target device picker** — a dropdown lists every connected USB-C device (removable USB storage volumes + MTP/PTP portable devices like the KM100). Pick which one to inspect/benchmark; the tiles, banner, and benchmark target all follow your selection.
+- The picker **only lists removable/portable devices** — the system drive (C:) and other fixed/internal disks are excluded, so it never mistakes your boot drive for the cable under test.
+- Your selection is preserved across re-detection (stable device keys); Batch Mode clears it so the next cable is auto-selected.
+
 ### Robustness & UX
 - Detection fallback chain: WMI `Win32_VolumeChangeEvent` → `psutil` polling → manual **Rescan**
 - **Auto-relaunch-as-admin** with amber banner when elevation is missing
@@ -87,6 +92,7 @@ A **GitHub Actions** workflow (`.github/workflows/build.yml`) auto-builds `dist/
 
 ## Notes / limitations
 
+- Only removable/portable devices are shown as targets. Fixed and network drives (including the C: system drive) are deliberately excluded.
 - A charge-only cable connected to a charge-only device always reads as charge-only — the app cannot distinguish cable type without a data-capable device on the far end.
 - MTP/PTP detection and the copy-based MTP benchmark use the Windows Portable Devices shell namespace and depend on the device's connection mode. If the KM100 offers a "USB Mass Storage / UMS" mode in its own settings, selecting it gives a normal drive letter and the standard (faster) benchmark path is used automatically.
 - USB generation and PD readouts are best-effort from WMI and depend on driver/vendor exposure.

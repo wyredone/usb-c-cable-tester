@@ -226,14 +226,41 @@ class DetectionEngine(threading.Thread):
         self._stop.set()
 
     def snapshot_volumes(self):
+        """Return only REMOVABLE volumes (USB storage), keyed by mountpoint.
+
+        Every fixed disk on Windows reports 'rw' in opts, so filtering on 'rw'
+        wrongly matched the C: system drive. We now include a volume only when
+        it is genuinely removable -- detected via the Win32 drive type
+        (DRIVE_REMOVABLE = 2) with a psutil 'removable' opts fallback -- and we
+        always exclude the system drive.
+        """
         vols = {}
         if psutil is None:
             return vols
+        system_drive = (os.environ.get("SystemDrive", "C:") + "\\").upper()
         try:
             for p in psutil.disk_partitions(all=False):
+                mp = p.mountpoint
+                if not mp:
+                    continue
+                if mp.upper().rstrip("\\") == system_drive.rstrip("\\"):
+                    continue  # never treat the system drive as a test target
                 opts = (p.opts or "").lower()
-                if "removable" in opts or "rw" in opts:
-                    vols[p.device] = p.mountpoint
+                is_removable = "removable" in opts
+                # Win32 drive-type check is authoritative when available.
+                try:
+                    import ctypes as _c
+                    dtype = _c.windll.kernel32.GetDriveTypeW(_c.c_wchar_p(mp))
+                    # 2 = DRIVE_REMOVABLE, 6 = DRIVE_RAMDISK. Exclude 3 (FIXED),
+                    # 4 (REMOTE/network), 5 (CDROM).
+                    if dtype == 2:
+                        is_removable = True
+                    elif dtype in (3, 4, 5):
+                        is_removable = False
+                except Exception:
+                    pass
+                if is_removable:
+                    vols[p.device] = mp
         except Exception as e:
             self.log.exc("snapshot_volumes", e)
         return vols
@@ -799,6 +826,7 @@ class App(ctk.CTk):
         self.current_mount = None
         self.data_capable = False
         self.mtp_target = None  # name of connected MTP device (e.g. KM100)
+        self.last_payload = {}
         self.tray = None
 
         ctk.set_appearance_mode(cfg.get("theme", "Dark"))
@@ -881,9 +909,26 @@ class App(ctk.CTk):
         self.lbl_gen.grid(row=0, column=1, padx=10, pady=8, sticky="w")
         self.lbl_pd.grid(row=0, column=2, padx=10, pady=8, sticky="w")
 
+        # Device picker row
+        picker = ctk.CTkFrame(self)
+        picker.grid(row=5, column=0, sticky="ew", padx=16, pady=(6, 0))
+        picker.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(picker, text="Target device:", font=("Segoe UI", 13, "bold")).grid(
+            row=0, column=0, padx=(10, 8), pady=8, sticky="w"
+        )
+        self.device_var = ctk.StringVar(value="(no USB-C devices detected)")
+        self.device_menu = ctk.CTkOptionMenu(
+            picker, variable=self.device_var, values=["(no USB-C devices detected)"],
+            command=self._on_device_selected, width=420,
+        )
+        self.device_menu.grid(row=0, column=1, padx=6, pady=8, sticky="ew")
+        # Maps the human label shown in the menu -> device descriptor dict.
+        self.device_options = {}
+        self.selected_key = None  # stable key of the user's chosen device
+
         # Controls
         controls = ctk.CTkFrame(self, fg_color="transparent")
-        controls.grid(row=5, column=0, sticky="ew", padx=16, pady=6)
+        controls.grid(row=6, column=0, sticky="ew", padx=16, pady=6)
         self.btn_bench = ctk.CTkButton(
             controls, text="Run Benchmark", command=self._run_benchmark,
             fg_color=COLOR["idle"], state="disabled", width=160,
@@ -908,8 +953,8 @@ class App(ctk.CTk):
 
         # History table
         hist_frame = ctk.CTkFrame(self)
-        hist_frame.grid(row=6, column=0, sticky="nsew", padx=16, pady=6)
-        self.grid_rowconfigure(6, weight=1)
+        hist_frame.grid(row=7, column=0, sticky="nsew", padx=16, pady=6)
+        self.grid_rowconfigure(7, weight=1)
         hist_frame.grid_columnconfigure(0, weight=1)
         hist_frame.grid_rowconfigure(1, weight=1)
         top = ctk.CTkFrame(hist_frame, fg_color="transparent")
@@ -930,7 +975,7 @@ class App(ctk.CTk):
 
         # Log strip
         self.logbox = ctk.CTkTextbox(self, height=110)
-        self.logbox.grid(row=7, column=0, sticky="ew", padx=16, pady=(6, 12))
+        self.logbox.grid(row=8, column=0, sticky="ew", padx=16, pady=(6, 12))
         self._log_ui(f"{APP_NAME} v{APP_VERSION} started at {stamp_line()}")
 
     # -- helpers -------------------------------------------------------------
@@ -985,73 +1030,67 @@ class App(ctk.CTk):
             pass
         self.after(300, self._drain_queue)
 
+    def _build_device_list(self, p):
+        """Normalize the payload into a unified selectable device list.
+
+        Each entry: {key, label, kind, mount|mtp_name, type}
+        kind is 'mass_storage' | 'mtp' | 'ptp'. 'key' is stable across polls so
+        the user's selection survives re-detection.
+        """
+        devices = []
+        for dev, mp in p.get("volumes", {}).items():
+            devices.append({
+                "key": "vol:" + str(dev),
+                "label": f"USB Storage \u2014 {mp} ({dev})",
+                "kind": "mass_storage",
+                "mount": mp,
+                "mtp_name": None,
+            })
+        for m in p.get("mtp_devices", []):
+            kind = "mtp" if m.get("type") == "MTP" else "ptp"
+            tag = "MTP" if kind == "mtp" else "PTP/camera"
+            devices.append({
+                "key": "mtp:" + m["name"],
+                "label": f"{m['name']} ({tag})",
+                "kind": kind,
+                "mount": None,
+                "mtp_name": m["name"],
+            })
+        return devices
+
     def _apply_detection(self, p):
-        vols = p.get("volumes", {})
-        usb = p.get("usb_devices", [])
-        mtp = p.get("mtp_devices", [])
+        self.last_payload = p
         gen = p.get("generation", "Unknown")
         pdv = p.get("pd_voltage")
+        usb = p.get("usb_devices", [])
 
-        mtp_dev = mtp[0] if mtp else None
-        mtp_is_data = bool(mtp_dev and mtp_dev.get("type") == "MTP")
+        devices = self._build_device_list(p)
+        self.device_options = {d["label"]: d for d in devices}
 
-        # Cable connected tile
-        if usb or vols or mtp:
+        # Cable connected tile (any far-end presence)
+        if usb or devices:
             self.tile_conn.set("green", "Detected")
         else:
             self.tile_conn.set("red", "Nothing")
 
-        # Device Type tile
-        if vols:
-            self.tile_type.set("green", "Mass Storage")
-        elif mtp_is_data:
-            self.tile_type.set("green", "MTP")
-        elif mtp_dev:
-            self.tile_type.set("amber", "PTP (camera)")
-        elif usb:
-            self.tile_type.set("amber", "USB (no storage)")
+        # Populate the picker, preserving the current selection when possible.
+        if devices:
+            labels = [d["label"] for d in devices]
+            self.device_menu.configure(values=labels, state="normal")
+            # Keep prior selection if its key still exists; else pick first.
+            cur = None
+            if self.selected_key:
+                cur = next((d for d in devices if d["key"] == self.selected_key), None)
+            if cur is None:
+                cur = devices[0]
+                self.selected_key = cur["key"]
+            self.device_var.set(cur["label"])
         else:
-            self.tile_type.set("idle", "—")
-
-        # Data capable inference (mass-storage OR MTP both prove data transfer)
-        if vols:
-            self.data_capable = True
-            self.current_mount = list(vols.values())[0]
-            self.mtp_target = None
-            self.tile_data.set("green", "Data OK")
-            self.btn_bench.configure(state="normal", fg_color=COLOR["green"])
-            self._set_banner("green", f"Data-capable cable — volume at {self.current_mount}")
-        elif mtp_is_data:
-            # MTP handshake succeeded (KM100, phone) -> cable carries data.
-            self.data_capable = True
-            self.current_mount = None
-            self.mtp_target = mtp_dev["name"]
-            self.tile_data.set("green", "Data OK (MTP)")
-            self.btn_bench.configure(state="normal", fg_color=COLOR["green"])
-            self._set_banner("green", f"Data-capable cable — MTP device '{mtp_dev['name']}'")
-        elif mtp_dev:
-            # PTP/camera mode: data link exists but no browsable storage.
-            self.data_capable = True
-            self.current_mount = None
-            self.mtp_target = None
-            self.tile_data.set("amber", "Data (PTP only)")
-            self.btn_bench.configure(state="disabled", fg_color=COLOR["idle"])
-            self._set_banner("amber", f"PTP/camera mode '{mtp_dev['name']}' — cable carries data, no file storage. Switch device to MTP/File Transfer.")
-        elif usb:
-            # USB device present but no volume/MTP -> likely charge-only / non-storage
-            self.data_capable = False
-            self.current_mount = None
-            self.mtp_target = None
-            self.tile_data.set("red", "Charge-only")
-            self.btn_bench.configure(state="disabled", fg_color=COLOR["idle"])
-            self._set_banner("red", "Charge-only (device present, no data volume)")
-        else:
-            self.data_capable = False
-            self.current_mount = None
-            self.mtp_target = None
-            self.tile_data.set("amber", "Inconclusive")
-            self.btn_bench.configure(state="disabled", fg_color=COLOR["idle"])
-            self._set_banner("amber", "Inconclusive — plug a data device on the far end")
+            self.selected_key = None
+            self.device_menu.configure(
+                values=["(no USB-C devices detected)"], state="disabled"
+            )
+            self.device_var.set("(no USB-C devices detected)")
 
         # Speed grade tile from negotiated generation
         if gen == "USB 2.0":
@@ -1061,10 +1100,12 @@ class App(ctk.CTk):
         else:
             self.tile_speed.set("green", gen)
 
-        # Info labels
-        if mtp_dev:
+        # Info labels (still show the far-end device summary)
+        mtp = p.get("mtp_devices", [])
+        if mtp:
+            m0 = mtp[0]
             self.lbl_device.configure(
-                text=f"Far-end device: {mtp_dev['name'][:40]} ({mtp_dev.get('type')})"
+                text=f"Far-end device: {m0['name'][:40]} ({m0.get('type')})"
             )
         elif usb:
             d = usb[0]
@@ -1072,14 +1113,71 @@ class App(ctk.CTk):
                 text=f"Far-end device: {d['name'][:40]} (VID {d.get('vid')}/PID {d.get('pid')})"
             )
         else:
-            self.lbl_device.configure(text="Far-end device: —")
+            self.lbl_device.configure(text="Far-end device: \u2014")
         self.lbl_gen.configure(text=f"USB generation: {gen}")
-        self.lbl_pd.configure(text=f"PD voltage: {pdv if pdv else '—'} V")
+        self.lbl_pd.configure(text=f"PD voltage: {pdv if pdv else '\u2014'} V")
 
         if p.get("added"):
             self._log_ui(f"Volume added: {p['added']}")
         if p.get("removed"):
             self._log_ui(f"Volume removed: {p['removed']}")
+
+        # Update tiles/banner/benchmark target for the selected device.
+        self._reflect_selection()
+
+    def _on_device_selected(self, label):
+        dev = self.device_options.get(label)
+        if dev:
+            self.selected_key = dev["key"]
+            self._log_ui(f"Selected target: {label}")
+        self._reflect_selection()
+
+    def _reflect_selection(self):
+        """Set Device Type / Data Capable tiles, banner, and benchmark target
+        based on the currently selected device (not a hardcoded first volume)."""
+        label = self.device_var.get()
+        dev = self.device_options.get(label)
+
+        if dev is None:
+            self.data_capable = False
+            self.current_mount = None
+            self.mtp_target = None
+            self.tile_type.set("idle", "\u2014")
+            usb = self.last_payload.get("usb_devices", []) if hasattr(self, "last_payload") else []
+            if usb:
+                self.tile_data.set("red", "Charge-only")
+                self._set_banner("red", "Charge-only (device present, no data volume)")
+            else:
+                self.tile_data.set("amber", "Inconclusive")
+                self._set_banner("amber", "Inconclusive \u2014 plug a data device on the far end")
+            self.btn_bench.configure(state="disabled", fg_color=COLOR["idle"])
+            return
+
+        kind = dev["kind"]
+        if kind == "mass_storage":
+            self.data_capable = True
+            self.current_mount = dev["mount"]
+            self.mtp_target = None
+            self.tile_type.set("green", "Mass Storage")
+            self.tile_data.set("green", "Data OK")
+            self.btn_bench.configure(state="normal", fg_color=COLOR["green"])
+            self._set_banner("green", f"Data-capable cable \u2014 volume at {dev['mount']}")
+        elif kind == "mtp":
+            self.data_capable = True
+            self.current_mount = None
+            self.mtp_target = dev["mtp_name"]
+            self.tile_type.set("green", "MTP")
+            self.tile_data.set("green", "Data OK (MTP)")
+            self.btn_bench.configure(state="normal", fg_color=COLOR["green"])
+            self._set_banner("green", f"Data-capable cable \u2014 MTP device '{dev['mtp_name']}'")
+        else:  # ptp
+            self.data_capable = True
+            self.current_mount = None
+            self.mtp_target = None
+            self.tile_type.set("amber", "PTP (camera)")
+            self.tile_data.set("amber", "Data (PTP only)")
+            self.btn_bench.configure(state="disabled", fg_color=COLOR["idle"])
+            self._set_banner("amber", f"PTP/camera mode '{dev['mtp_name']}' \u2014 cable carries data, no file storage. Switch device to MTP/File Transfer.")
 
     # -- benchmark -----------------------------------------------------------
     def _run_benchmark(self, calibrate=False):
@@ -1156,6 +1254,8 @@ class App(ctk.CTk):
 
     def _batch_mark(self):
         self._log_ui("Batch mode: remove this cable and connect the next one.")
+        # Clear the current selection so the next detected device is auto-picked.
+        self.selected_key = None
         self.tile_conn.set("idle", "Idle")
         self.tile_type.set("idle", "Idle")
         self.tile_data.set("idle", "Idle")
