@@ -764,23 +764,138 @@ class Benchmark:
             except Exception as e:
                 self.log.exc("benchmark_cleanup", e)
 
+    # Max seconds to wait for a pushed file to appear before treating the write
+    # as refused (leaves budget for the read-only fallback). Overridable.
+    MTP_WRITE_WAIT_S = 12.0
+
+    # Preferred writable subfolders on an Android/MTP device, in priority
+    # order. Android MTP roots often reject writes at the top level but accept
+    # them in these standard user folders (confirmed writable via Explorer).
+    MTP_WRITE_DIRS = ("Download", "Downloads", "Pictures", "DCIM", "Music",
+                      "Movies", "Documents")
+
+    def _mtp_first_storage(self, device_folder):
+        """Return the device's storage folder, descending one level if the
+        device root just contains a single storage node (e.g. Android's
+        'Internal shared storage', whose name is padded with bidi marks).
+
+        Returns (folder, name) or (device_folder, "<root>") if no descent.
+        """
+        try:
+            items = device_folder.Items()
+        except Exception:
+            return device_folder, "<root>"
+        # If there's exactly one child and it's a folder, that's the storage
+        # root -- descend into it. Match on IsFolder, NOT on name (the name is
+        # wrapped in invisible LTR/RTL marks and is not reliably comparable).
+        try:
+            if items.Count == 1 and getattr(items.Item(0), "IsFolder", False):
+                node = items.Item(0)
+                sub = node.GetFolder
+                if sub is not None:
+                    return sub, "storage"
+        except Exception:
+            pass
+        return device_folder, "<root>"
+
+    def _resolve_mtp_write_folder(self, device_folder):
+        """Pick a folder on the device most likely to accept a test write.
+
+        Descends into the storage root, then prefers a standard user folder
+        (Download/Pictures/DCIM/...). Falls back to the storage root, then the
+        device root. Returns (folder, human_path).
+        """
+        storage, _ = self._mtp_first_storage(device_folder)
+        # Look for a preferred writable user folder inside storage.
+        try:
+            items = storage.Items()
+            names = {}
+            for it in items:
+                try:
+                    if getattr(it, "IsFolder", False):
+                        names[getattr(it, "Name", "")] = it
+                except Exception:
+                    pass
+            for want in self.MTP_WRITE_DIRS:
+                for nm, it in names.items():
+                    if nm.strip() == want:
+                        sub = it.GetFolder
+                        if sub is not None:
+                            return sub, want
+        except Exception:
+            pass
+        return storage, "storage root"
+
+    def _find_existing_file(self, folder, deadline, min_bytes=256 * 1024,
+                            max_bytes=64 * 1024 * 1024, depth=0, maxdepth=3):
+        """Depth-first search for an existing readable file on the device to
+        use for a pull-only (read) benchmark when writes are refused.
+
+        Prefers a file in a reasonable size band so the read is measurable but
+        quick. Returns the shell item or None.
+        """
+        if time.time() > deadline or depth > maxdepth:
+            return None
+        try:
+            items = folder.Items()
+        except Exception:
+            return None
+        subfolders = []
+        for it in items:
+            if time.time() > deadline:
+                break
+            try:
+                if getattr(it, "IsFolder", False):
+                    subfolders.append(it)
+                    continue
+                # A file: accept the first one in the size band if we can size
+                # it; otherwise accept any file as a last resort.
+                sz = 0
+                try:
+                    sz = int(getattr(it, "Size", 0) or 0)
+                except Exception:
+                    sz = 0
+                if sz == 0 or (min_bytes <= sz <= max_bytes):
+                    return it
+            except Exception:
+                continue
+        for sf in subfolders:
+            if time.time() > deadline:
+                break
+            try:
+                child = sf.GetFolder
+                if child is not None:
+                    found = self._find_existing_file(
+                        child, deadline, min_bytes, max_bytes,
+                        depth + 1, maxdepth
+                    )
+                    if found is not None:
+                        return found
+            except Exception:
+                continue
+        return None
+
     def run_mtp(self, mtp_name, target_mb, progress_cb):
-        """Copy-based transfer benchmark for an MTP device (e.g. Autel KM100).
+        """Copy-based transfer benchmark for an MTP device (Autel/Rockchip,
+        phones, etc.).
 
         MTP devices have no drive letter, so a raw file benchmark is impossible.
         Instead we time a real copy of a temp file TO the device (push/write)
-        and back FROM it (pull/read) through the WPD shell namespace using
-        Explorer's own CopyHere. This yields the practical MTP transfer rate.
+        into a known-writable user folder (Download/Pictures/...) and back FROM
+        it (pull/read) through the WPD shell namespace via Explorer's CopyHere.
+        This yields the practical MTP transfer rate.
 
-        Falls back gracefully if the device rejects writes (many cameras /
-        read-only MTP roots do) -- only the pull (read) figure is reported then.
+        If the device refuses writes everywhere, we fall back to a PULL-ONLY
+        measurement using an existing file already on the device, so a read
+        throughput is still reported. Only if neither works do we report that
+        throughput was not measurable (the cable is still proven data-capable).
         """
         result = {"size_mb": 0, "mode": "MTP", "runs": []}
         size_mb = int(max(4, min(target_mb, 32)))
         result["size_mb"] = size_mb
         local_tmp = os.path.join(tempfile.gettempdir(), "usb_mtp_" + stamp_file() + ".bin")
-        deadline = time.time() + 20.0
-        target_folder = None
+        deadline = time.time() + 25.0
+        write_folder = None
         pushed_name = None
         FLAGS = 16 + 4 + 512  # yes-to-all + no-progress-ui + no-confirm-mkdir
         try:
@@ -803,30 +918,29 @@ class Benchmark:
                 result["error"] = "MTP device not found: " + str(mtp_name)
                 return result
 
-            target_folder = device_item.GetFolder
-            try:
-                sub = target_folder.Items()
-                if sub.Count > 0 and getattr(sub.Item(0), "IsFolder", False):
-                    target_folder = sub.Item(0).GetFolder
-            except Exception:
-                pass
+            device_folder = device_item.GetFolder
+            write_folder, write_path = self._resolve_mtp_write_folder(device_folder)
+            result["target_path"] = write_path
 
             progress_cb("Preparing MTP test file...")
             with open(local_tmp, "wb") as f:
                 f.write(os.urandom(size_mb * 1024 * 1024))
             pushed_name = os.path.basename(local_tmp)
 
-            progress_cb("MTP push (write) in progress...")
+            progress_cb(f"MTP push (write) to '{write_path}'...")
             src_folder = shell.NameSpace(os.path.dirname(local_tmp))
             src_item = src_folder.ParseName(pushed_name)
             t0 = time.time()
             write_mbps = 0
+            # Bound the write-appearance wait so a refusing device does NOT burn
+            # the whole budget -- we must leave time for the read-only fallback.
+            write_deadline = min(deadline, t0 + self.MTP_WRITE_WAIT_S)
             try:
-                target_folder.CopyHere(src_item, FLAGS)
+                write_folder.CopyHere(src_item, FLAGS)
                 appeared = False
-                while time.time() < deadline:
+                while time.time() < write_deadline:
                     try:
-                        if target_folder.ParseName(pushed_name) is not None:
+                        if write_folder.ParseName(pushed_name) is not None:
                             appeared = True
                             break
                     except Exception:
@@ -836,30 +950,62 @@ class Benchmark:
                 if appeared and wt > 0:
                     write_mbps = size_mb / wt
                 else:
-                    result["write_note"] = "Device did not accept the write (read-only MTP root)."
+                    result["write_note"] = (
+                        "Device refused the write to '%s' -- trying read-only."
+                        % write_path
+                    )
             except Exception as e:
                 result["write_note"] = "Write not supported: " + str(e)
 
+            # --- Pull (read) ---
             progress_cb("MTP pull (read) in progress...")
             read_mbps = 0
+            read_note = None
             pull_dir = tempfile.mkdtemp(prefix="usb_mtp_pull_")
             dst_folder = shell.NameSpace(pull_dir)
-            try:
-                src_on_device = target_folder.ParseName(pushed_name)
-            except Exception:
-                src_on_device = None
+
+            # Case A: our pushed file made it -> pull it back (round-trip).
+            src_on_device = None
+            expected_mb = size_mb
+            if write_mbps > 0:
+                try:
+                    src_on_device = write_folder.ParseName(pushed_name)
+                except Exception:
+                    src_on_device = None
+
+            # Case B: write failed -> find an existing file on the device to
+            # measure read throughput anyway (pull-only fallback).
+            pulled_name = pushed_name
+            if src_on_device is None:
+                existing = self._find_existing_file(device_folder, deadline)
+                if existing is not None:
+                    src_on_device = existing
+                    pulled_name = getattr(existing, "Name", "pulled.bin")
+                    try:
+                        esz = int(getattr(existing, "Size", 0) or 0)
+                        expected_mb = max(0.001, esz / (1024 * 1024)) if esz else None
+                    except Exception:
+                        expected_mb = None
+                    read_note = "Read-only: pulled existing file '%s'." % pulled_name[:40]
+
             if src_on_device is not None:
                 t0 = time.time()
                 dst_folder.CopyHere(src_on_device, FLAGS)
-                pulled = os.path.join(pull_dir, pushed_name)
-                need = size_mb * 1024 * 1024 * 0.98
+                pulled = os.path.join(pull_dir, pulled_name)
                 while time.time() < deadline:
-                    if os.path.exists(pulled) and os.path.getsize(pulled) >= need:
-                        break
+                    if os.path.exists(pulled):
+                        # If we know the expected size, wait for it; else accept
+                        # presence + stable size.
+                        if expected_mb is None:
+                            time.sleep(0.4)
+                            break
+                        if os.path.getsize(pulled) >= expected_mb * 1024 * 1024 * 0.98:
+                            break
                     time.sleep(0.3)
                 rt = time.time() - t0
                 if rt > 0 and os.path.exists(pulled):
-                    read_mbps = size_mb / rt
+                    got_mb = os.path.getsize(pulled) / (1024 * 1024)
+                    read_mbps = got_mb / rt if got_mb > 0 else 0
                 try:
                     if os.path.exists(pulled):
                         os.remove(pulled)
@@ -870,12 +1016,18 @@ class Benchmark:
             except Exception:
                 pass
 
+            if read_note:
+                result["read_note"] = read_note
+
             result["write"] = {"min": write_mbps, "avg": write_mbps, "max": write_mbps}
             result["read"] = {"min": read_mbps, "avg": read_mbps, "max": read_mbps}
             result["rand4k"] = {"min": 0, "avg": 0, "max": 0}
             result["anomaly"] = None
             if write_mbps == 0 and read_mbps == 0:
-                result["error"] = "MTP transfer could not be measured (device busy or read-only)."
+                result["error"] = (
+                    "MTP throughput not measurable (device refused writes and no "
+                    "readable file found). Cable is still confirmed data-capable."
+                )
             self.log.event("INFO", "benchmark_mtp_complete", result)
             return result
         except Exception as e:
@@ -888,9 +1040,11 @@ class Benchmark:
                     os.remove(local_tmp)
             except Exception:
                 pass
+            # Clean up our pushed test file from the device (never delete the
+            # user's existing files used for the read-only fallback).
             try:
-                if target_folder is not None and pushed_name:
-                    leftover = target_folder.ParseName(pushed_name)
+                if write_folder is not None and pushed_name:
+                    leftover = write_folder.ParseName(pushed_name)
                     if leftover is not None:
                         leftover.InvokeVerb("delete")
             except Exception:
@@ -1357,7 +1511,25 @@ class App(ctk.CTk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _benchmark_done(self, res, gen, calibrate):
+        is_mtp = res.get("mode") == "MTP"
+        # For MTP, a "not measurable" result is NOT a cable failure -- the cable
+        # is still data-capable. Show it as amber/informational, not red.
         if res.get("error"):
+            if is_mtp:
+                self.tile_speed.set("amber", "MTP: not measurable")
+                self.btn_bench.configure(state="normal", fg_color=COLOR["green"], text="Run Benchmark")
+                self._log_ui(res["error"])
+                if res.get("target_path"):
+                    self._log_ui(f"Target folder tried: {res['target_path']}")
+                if res.get("write_note"):
+                    self._log_ui(res["write_note"])
+                if res.get("read_note"):
+                    self._log_ui(res["read_note"])
+                self._chime(True)
+                row = (stamp_line(), "Data OK (MTP)", gen + " / MTP", "n/a", "n/a", "n/a")
+                self.tree.insert("", 0, values=row)
+                self._append_history(row)
+                return
             self.tile_speed.set("red", "Test failed")
             self.btn_bench.configure(state="normal", fg_color=COLOR["red"], text="Run Benchmark")
             self._log_ui(f"Benchmark error: {res['error']}")
@@ -1366,14 +1538,28 @@ class App(ctk.CTk):
         w = res["write"]["avg"]
         r = res["read"]["avg"]
         rnd = res["rand4k"]["avg"]
-        is_mtp = res.get("mode") == "MTP"
         verdict = "Data OK (MTP)" if is_mtp else "Data OK"
         state = "green"
         if is_mtp:
             # MTP is inherently slower; don't red/amber-flag it as a bad cable.
             gen = gen + " / MTP"
+            if res.get("target_path"):
+                self._log_ui(f"MTP target folder: {res['target_path']}")
             if res.get("write_note"):
                 self._log_ui(res["write_note"])
+            if res.get("read_note"):
+                self._log_ui(res["read_note"])
+            # Pull-only fallback: write refused but read measured.
+            if w == 0 and r > 0:
+                verdict = "Data OK (MTP, read-only)"
+                self.tile_speed.set("green", f"{r:.0f} MB/s read (RO)")
+                self.btn_bench.configure(state="normal", fg_color=COLOR["green"], text="Run Benchmark")
+                self._log_ui(f"Read {r:.0f} MB/s (write refused; pull-only)")
+                self._chime(True)
+                row = (stamp_line(), verdict, gen, "n/a", f"{r:.0f}", "0.0")
+                self.tree.insert("", 0, values=row)
+                self._append_history(row)
+                return
         elif r < 40:
             state, verdict = "amber", "Slow (USB 2.0 class)"
         self.tile_speed.set(state, f"{r:.0f} MB/s read")
