@@ -8,10 +8,18 @@ A Windows 10/11 desktop app that infers whether a connected USB-C cable supports
 
 ### Color-coded status
 - **Cable Connected** tile — green (device detected) / red (nothing) 
-- **Data Capable** tile — green (data OK) / red (charge-only) / amber (inconclusive)
+- **Device Type** tile — Mass Storage / MTP / PTP (camera) / USB (no storage)
+- **Data Capable** tile — green (data OK, incl. MTP) / red (charge-only) / amber (PTP-only or inconclusive)
 - **Speed Grade** tile — green (USB 3.x+) / amber (USB 2.0 / slow) / red (test failed)
 - **LED-style banner** + **color-matched tray icon**
 - Toggleable **audible pass/fail chime**
+
+### MTP / PTP device support (Autel KM100, phones, cameras)
+Some devices — including the **Autel KM100** — connect over **MTP/PTP (Windows Portable Devices)** instead of USB Mass Storage, so they show up like a phone or camera and never get a drive letter. The app detects these through the **WPD shell namespace**:
+- If a device enumerates over **MTP** (browsable content tree), that alone proves the **cable carries data** → Data Capable = green "Data OK (MTP)".
+- **PTP/camera mode** (no browsable storage) → amber: the cable works, but switch the device to **MTP / File Transfer** mode for file access.
+- Because MTP has no drive letter, the speed test uses a **copy-based benchmark** — it times a real file **push (write)** to the device and **pull (read)** back through Explorer's WPD copy engine, reporting the practical MTP transfer rate. Read-only MTP roots report the pull figure only.
+- MTP transfer is inherently slower than raw mass storage; the Speed Grade tile does **not** flag a low MTP rate as a bad cable.
 
 ### Detection & accuracy
 - Per-port USB **generation label** (USB 2.0 / 3.x / 3.2 Gen2 / USB4·Thunderbolt) via WMI
@@ -80,5 +88,6 @@ A **GitHub Actions** workflow (`.github/workflows/build.yml`) auto-builds `dist/
 ## Notes / limitations
 
 - A charge-only cable connected to a charge-only device always reads as charge-only — the app cannot distinguish cable type without a data-capable device on the far end.
+- MTP/PTP detection and the copy-based MTP benchmark use the Windows Portable Devices shell namespace and depend on the device's connection mode. If the KM100 offers a "USB Mass Storage / UMS" mode in its own settings, selecting it gives a normal drive letter and the standard (faster) benchmark path is used automatically.
 - USB generation and PD readouts are best-effort from WMI and depend on driver/vendor exposure.
 - Admin privileges are recommended for raw WMI USB event subscriptions.

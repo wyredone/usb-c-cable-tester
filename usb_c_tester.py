@@ -49,6 +49,7 @@ import json
 import os
 import queue
 import random
+import tempfile
 import threading
 import time
 import traceback
@@ -344,8 +345,75 @@ class DetectionEngine(threading.Thread):
                 pass
         return None
 
+    def enumerate_mtp(self):
+        """Enumerate MTP/PTP (Windows Portable Devices) via the Shell namespace.
+
+        MTP/PTP devices (phones, cameras, and the Autel KM100) never receive a
+        drive letter -- Windows exposes them through the WPD shell namespace
+        instead, so psutil / Win32_VolumeChangeEvent cannot see them. This walks
+        "This PC" and returns any portable-device nodes. The fact that a device
+        enumerates over MTP at all proves the cable carries data.
+
+        Returns a list of dicts: {name, type, shell_path}.
+        type is 'MTP' when the device exposes a browsable content tree, else
+        'PTP' (camera-style, image-only / no browsable storage).
+        """
+        devices = []
+        try:
+            import win32com.client
+            import pythoncom
+
+            pythoncom.CoInitialize()
+            shell = win32com.client.Dispatch("Shell.Application")
+            # 17 = ssfDRIVES ("This PC"): contains drives AND portable devices.
+            this_pc = shell.NameSpace(17)
+            if this_pc is None:
+                return devices
+            for item in this_pc.Items():
+                try:
+                    is_folder = bool(getattr(item, "IsFolder", False))
+                    # Drives report a filesystem path (e.g. 'C:\\'); portable
+                    # devices report a shell path with no drive letter.
+                    path = getattr(item, "Path", "") or ""
+                    has_drive_letter = len(path) >= 2 and path[1] == ":"
+                    if has_drive_letter:
+                        continue  # mass-storage volume -- handled elsewhere
+                    if not is_folder:
+                        continue
+                    name = getattr(item, "Name", "Portable Device")
+                    # If it has browsable child content -> MTP; else PTP-camera.
+                    # MTP => device exposes a browsable content tree with at
+                    # least one storage node. PTP/camera => no browsable
+                    # storage (empty or inaccessible folder).
+                    dev_type = "PTP"
+                    try:
+                        folder = item.GetFolder
+                        if folder is not None and folder.Items().Count > 0:
+                            dev_type = "MTP"
+                    except Exception:
+                        dev_type = "PTP"
+                    devices.append(
+                        {"name": name, "type": dev_type, "shell_path": path}
+                    )
+                except Exception as e:
+                    self.log.exc("enumerate_mtp_item", e)
+        except Exception as e:
+            self.log.exc("enumerate_mtp", e)
+        finally:
+            try:
+                import pythoncom
+
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
+        return devices
+
+    def _mtp_signature(self, mtp_devices):
+        return tuple(sorted(d["name"] for d in mtp_devices))
+
     def run(self):
         self._known = set(self.snapshot_volumes().keys())
+        self._known_mtp = self._mtp_signature(self.enumerate_mtp())
         self.log.event("INFO", "detection_started", {"known_volumes": list(self._known)})
         use_wmi = wmi is not None
         watcher = None
@@ -407,16 +475,23 @@ class DetectionEngine(threading.Thread):
         removed = self._known - cur_keys
         self._known = cur_keys
 
+        # MTP/WPD devices (KM100, phones, cameras) also count as a change.
+        mtp_devices = self.enumerate_mtp()
+        mtp_sig = self._mtp_signature(mtp_devices)
+        mtp_changed = mtp_sig != getattr(self, "_known_mtp", tuple())
+        self._known_mtp = mtp_sig
+
         # Emit only on an actual change or an explicit force (initial/rescan).
-        # Never emit repeatedly just because no volumes are present -- that
-        # would flood the queue and re-run WMI every poll cycle.
-        if force or added or removed:
+        # Never emit repeatedly just because nothing is present -- that would
+        # flood the queue and re-run WMI/WPD every poll cycle.
+        if force or added or removed or mtp_changed:
             usb = self.enumerate_usb()
             payload = {
                 "volumes": current,
                 "added": list(added),
                 "removed": list(removed),
                 "usb_devices": usb,
+                "mtp_devices": mtp_devices,
                 "generation": self.usb_generation(),
                 "pd_voltage": self.pd_wattage(),
             }
@@ -542,6 +617,144 @@ class Benchmark:
             except Exception as e:
                 self.log.exc("benchmark_cleanup", e)
 
+    def run_mtp(self, mtp_name, target_mb, progress_cb):
+        """Copy-based transfer benchmark for an MTP device (e.g. Autel KM100).
+
+        MTP devices have no drive letter, so a raw file benchmark is impossible.
+        Instead we time a real copy of a temp file TO the device (push/write)
+        and back FROM it (pull/read) through the WPD shell namespace using
+        Explorer's own CopyHere. This yields the practical MTP transfer rate.
+
+        Falls back gracefully if the device rejects writes (many cameras /
+        read-only MTP roots do) -- only the pull (read) figure is reported then.
+        """
+        result = {"size_mb": 0, "mode": "MTP", "runs": []}
+        size_mb = int(max(4, min(target_mb, 32)))
+        result["size_mb"] = size_mb
+        local_tmp = os.path.join(tempfile.gettempdir(), "usb_mtp_" + stamp_file() + ".bin")
+        deadline = time.time() + 20.0
+        target_folder = None
+        pushed_name = None
+        FLAGS = 16 + 4 + 512  # yes-to-all + no-progress-ui + no-confirm-mkdir
+        try:
+            import win32com.client
+            import pythoncom
+
+            pythoncom.CoInitialize()
+            shell = win32com.client.Dispatch("Shell.Application")
+            this_pc = shell.NameSpace(17)
+            if this_pc is None:
+                result["error"] = "Could not open This PC namespace."
+                return result
+
+            device_item = None
+            for item in this_pc.Items():
+                if getattr(item, "Name", "") == mtp_name:
+                    device_item = item
+                    break
+            if device_item is None:
+                result["error"] = "MTP device not found: " + str(mtp_name)
+                return result
+
+            target_folder = device_item.GetFolder
+            try:
+                sub = target_folder.Items()
+                if sub.Count > 0 and getattr(sub.Item(0), "IsFolder", False):
+                    target_folder = sub.Item(0).GetFolder
+            except Exception:
+                pass
+
+            progress_cb("Preparing MTP test file...")
+            with open(local_tmp, "wb") as f:
+                f.write(os.urandom(size_mb * 1024 * 1024))
+            pushed_name = os.path.basename(local_tmp)
+
+            progress_cb("MTP push (write) in progress...")
+            src_folder = shell.NameSpace(os.path.dirname(local_tmp))
+            src_item = src_folder.ParseName(pushed_name)
+            t0 = time.time()
+            write_mbps = 0
+            try:
+                target_folder.CopyHere(src_item, FLAGS)
+                appeared = False
+                while time.time() < deadline:
+                    try:
+                        if target_folder.ParseName(pushed_name) is not None:
+                            appeared = True
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(0.3)
+                wt = time.time() - t0
+                if appeared and wt > 0:
+                    write_mbps = size_mb / wt
+                else:
+                    result["write_note"] = "Device did not accept the write (read-only MTP root)."
+            except Exception as e:
+                result["write_note"] = "Write not supported: " + str(e)
+
+            progress_cb("MTP pull (read) in progress...")
+            read_mbps = 0
+            pull_dir = tempfile.mkdtemp(prefix="usb_mtp_pull_")
+            dst_folder = shell.NameSpace(pull_dir)
+            try:
+                src_on_device = target_folder.ParseName(pushed_name)
+            except Exception:
+                src_on_device = None
+            if src_on_device is not None:
+                t0 = time.time()
+                dst_folder.CopyHere(src_on_device, FLAGS)
+                pulled = os.path.join(pull_dir, pushed_name)
+                need = size_mb * 1024 * 1024 * 0.98
+                while time.time() < deadline:
+                    if os.path.exists(pulled) and os.path.getsize(pulled) >= need:
+                        break
+                    time.sleep(0.3)
+                rt = time.time() - t0
+                if rt > 0 and os.path.exists(pulled):
+                    read_mbps = size_mb / rt
+                try:
+                    if os.path.exists(pulled):
+                        os.remove(pulled)
+                except Exception:
+                    pass
+            try:
+                os.rmdir(pull_dir)
+            except Exception:
+                pass
+
+            result["write"] = {"min": write_mbps, "avg": write_mbps, "max": write_mbps}
+            result["read"] = {"min": read_mbps, "avg": read_mbps, "max": read_mbps}
+            result["rand4k"] = {"min": 0, "avg": 0, "max": 0}
+            result["anomaly"] = None
+            if write_mbps == 0 and read_mbps == 0:
+                result["error"] = "MTP transfer could not be measured (device busy or read-only)."
+            self.log.event("INFO", "benchmark_mtp_complete", result)
+            return result
+        except Exception as e:
+            self.log.exc("benchmark_mtp", e)
+            result["error"] = str(e)
+            return result
+        finally:
+            try:
+                if os.path.exists(local_tmp):
+                    os.remove(local_tmp)
+            except Exception:
+                pass
+            try:
+                if target_folder is not None and pushed_name:
+                    leftover = target_folder.ParseName(pushed_name)
+                    if leftover is not None:
+                        leftover.InvokeVerb("delete")
+            except Exception:
+                pass
+            try:
+                import pythoncom
+
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
+
 
 # ----------------------------------------------------------------------------
 # Tray icon (color-matched)
@@ -585,6 +798,7 @@ class App(ctk.CTk):
         self.bench = Benchmark(logger)
         self.current_mount = None
         self.data_capable = False
+        self.mtp_target = None  # name of connected MTP device (e.g. KM100)
         self.tray = None
 
         ctk.set_appearance_mode(cfg.get("theme", "Dark"))
@@ -645,14 +859,16 @@ class App(ctk.CTk):
         # Status tiles
         tiles = ctk.CTkFrame(self, fg_color="transparent")
         tiles.grid(row=3, column=0, sticky="ew", padx=16, pady=6)
-        for i in range(3):
+        for i in range(4):
             tiles.grid_columnconfigure(i, weight=1)
         self.tile_conn = StatusTile(tiles, "Cable Connected")
+        self.tile_type = StatusTile(tiles, "Device Type")
         self.tile_data = StatusTile(tiles, "Data Capable")
         self.tile_speed = StatusTile(tiles, "Speed Grade")
         self.tile_conn.grid(row=0, column=0, padx=6, pady=6, sticky="nsew")
-        self.tile_data.grid(row=0, column=1, padx=6, pady=6, sticky="nsew")
-        self.tile_speed.grid(row=0, column=2, padx=6, pady=6, sticky="nsew")
+        self.tile_type.grid(row=0, column=1, padx=6, pady=6, sticky="nsew")
+        self.tile_data.grid(row=0, column=2, padx=6, pady=6, sticky="nsew")
+        self.tile_speed.grid(row=0, column=3, padx=6, pady=6, sticky="nsew")
 
         # Info row: far-end device, generation, PD
         info = ctk.CTkFrame(self)
@@ -772,32 +988,67 @@ class App(ctk.CTk):
     def _apply_detection(self, p):
         vols = p.get("volumes", {})
         usb = p.get("usb_devices", [])
+        mtp = p.get("mtp_devices", [])
         gen = p.get("generation", "Unknown")
         pdv = p.get("pd_voltage")
 
+        mtp_dev = mtp[0] if mtp else None
+        mtp_is_data = bool(mtp_dev and mtp_dev.get("type") == "MTP")
+
         # Cable connected tile
-        if usb or vols:
+        if usb or vols or mtp:
             self.tile_conn.set("green", "Detected")
         else:
             self.tile_conn.set("red", "Nothing")
 
-        # Data capable inference
+        # Device Type tile
+        if vols:
+            self.tile_type.set("green", "Mass Storage")
+        elif mtp_is_data:
+            self.tile_type.set("green", "MTP")
+        elif mtp_dev:
+            self.tile_type.set("amber", "PTP (camera)")
+        elif usb:
+            self.tile_type.set("amber", "USB (no storage)")
+        else:
+            self.tile_type.set("idle", "—")
+
+        # Data capable inference (mass-storage OR MTP both prove data transfer)
         if vols:
             self.data_capable = True
             self.current_mount = list(vols.values())[0]
+            self.mtp_target = None
             self.tile_data.set("green", "Data OK")
             self.btn_bench.configure(state="normal", fg_color=COLOR["green"])
             self._set_banner("green", f"Data-capable cable — volume at {self.current_mount}")
+        elif mtp_is_data:
+            # MTP handshake succeeded (KM100, phone) -> cable carries data.
+            self.data_capable = True
+            self.current_mount = None
+            self.mtp_target = mtp_dev["name"]
+            self.tile_data.set("green", "Data OK (MTP)")
+            self.btn_bench.configure(state="normal", fg_color=COLOR["green"])
+            self._set_banner("green", f"Data-capable cable — MTP device '{mtp_dev['name']}'")
+        elif mtp_dev:
+            # PTP/camera mode: data link exists but no browsable storage.
+            self.data_capable = True
+            self.current_mount = None
+            self.mtp_target = None
+            self.tile_data.set("amber", "Data (PTP only)")
+            self.btn_bench.configure(state="disabled", fg_color=COLOR["idle"])
+            self._set_banner("amber", f"PTP/camera mode '{mtp_dev['name']}' — cable carries data, no file storage. Switch device to MTP/File Transfer.")
         elif usb:
-            # USB device present but no volume -> likely charge-only / non-storage
+            # USB device present but no volume/MTP -> likely charge-only / non-storage
             self.data_capable = False
             self.current_mount = None
+            self.mtp_target = None
             self.tile_data.set("red", "Charge-only")
             self.btn_bench.configure(state="disabled", fg_color=COLOR["idle"])
             self._set_banner("red", "Charge-only (device present, no data volume)")
         else:
             self.data_capable = False
             self.current_mount = None
+            self.mtp_target = None
             self.tile_data.set("amber", "Inconclusive")
             self.btn_bench.configure(state="disabled", fg_color=COLOR["idle"])
             self._set_banner("amber", "Inconclusive — plug a data device on the far end")
@@ -811,7 +1062,11 @@ class App(ctk.CTk):
             self.tile_speed.set("green", gen)
 
         # Info labels
-        if usb:
+        if mtp_dev:
+            self.lbl_device.configure(
+                text=f"Far-end device: {mtp_dev['name'][:40]} ({mtp_dev.get('type')})"
+            )
+        elif usb:
             d = usb[0]
             self.lbl_device.configure(
                 text=f"Far-end device: {d['name'][:40]} (VID {d.get('vid')}/PID {d.get('pid')})"
@@ -828,18 +1083,24 @@ class App(ctk.CTk):
 
     # -- benchmark -----------------------------------------------------------
     def _run_benchmark(self, calibrate=False):
-        if not self.current_mount:
-            self._log_ui("No data volume to benchmark.")
+        # Route to the mass-storage benchmark or the MTP copy benchmark.
+        if not self.current_mount and not self.mtp_target:
+            self._log_ui("No data volume or MTP device to benchmark.")
             return
         self.btn_bench.configure(state="disabled", fg_color=COLOR["amber"], text="Testing...")
         mount = self.current_mount
+        mtp_name = self.mtp_target
         gen = self.lbl_gen.cget("text").replace("USB generation: ", "")
 
         def worker():
             def prog(msg):
                 self.after(0, lambda: self._log_ui(msg))
 
-            res = self.bench.run(mount, self.cfg.get("test_size_mb", 256), prog)
+            if mount:
+                res = self.bench.run(mount, self.cfg.get("test_size_mb", 256), prog)
+            else:
+                self.after(0, lambda: self._log_ui(f"MTP benchmark on '{mtp_name}' (copy-based)."))
+                res = self.bench.run_mtp(mtp_name, self.cfg.get("test_size_mb", 256), prog)
             self.after(0, lambda: self._benchmark_done(res, gen, calibrate))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -854,9 +1115,15 @@ class App(ctk.CTk):
         w = res["write"]["avg"]
         r = res["read"]["avg"]
         rnd = res["rand4k"]["avg"]
-        verdict = "Data OK"
+        is_mtp = res.get("mode") == "MTP"
+        verdict = "Data OK (MTP)" if is_mtp else "Data OK"
         state = "green"
-        if r < 40:
+        if is_mtp:
+            # MTP is inherently slower; don't red/amber-flag it as a bad cable.
+            gen = gen + " / MTP"
+            if res.get("write_note"):
+                self._log_ui(res["write_note"])
+        elif r < 40:
             state, verdict = "amber", "Slow (USB 2.0 class)"
         self.tile_speed.set(state, f"{r:.0f} MB/s read")
         self.btn_bench.configure(state="normal", fg_color=COLOR["green"], text="Run Benchmark")
@@ -890,6 +1157,7 @@ class App(ctk.CTk):
     def _batch_mark(self):
         self._log_ui("Batch mode: remove this cable and connect the next one.")
         self.tile_conn.set("idle", "Idle")
+        self.tile_type.set("idle", "Idle")
         self.tile_data.set("idle", "Idle")
         self.tile_speed.set("idle", "Idle")
         self._set_banner("idle", "Batch: waiting for next cable...")

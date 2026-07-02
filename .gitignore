@@ -27,3 +27,5 @@ Desktop.ini
 
 # Dev/test scaffolding
 test_harness.py
+mtp_tests.py
+mtp_method.txt
