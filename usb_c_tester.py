@@ -361,6 +361,10 @@ class DetectionEngine(threading.Thread):
                 self.log.exc("wmi_watch_init", e)
                 use_wmi = False
 
+        # Emit one initial state so the GUI reflects reality on startup.
+        self._diff_and_emit(force=True)
+        timed_out_exc = getattr(wmi, "x_wmi_timed_out", None) if wmi else None
+
         while not self._stop.is_set():
             try:
                 if use_wmi and watcher is not None:
@@ -368,8 +372,15 @@ class DetectionEngine(threading.Thread):
                         evt = watcher(timeout_ms=1500)
                         if evt is not None:
                             self._diff_and_emit()
-                    except wmi.x_wmi_timed_out:
-                        pass
+                    except Exception as we:
+                        # WMI raises a timeout exception when no event arrives
+                        # within timeout_ms; that is normal -- keep looping.
+                        if timed_out_exc and isinstance(we, timed_out_exc):
+                            pass
+                        elif "timed_out" in type(we).__name__.lower():
+                            pass
+                        else:
+                            raise
                 else:
                     self._diff_and_emit()
                     time.sleep(2.0)
@@ -396,7 +407,10 @@ class DetectionEngine(threading.Thread):
         removed = self._known - cur_keys
         self._known = cur_keys
 
-        if force or added or removed or (not cur_keys):
+        # Emit only on an actual change or an explicit force (initial/rescan).
+        # Never emit repeatedly just because no volumes are present -- that
+        # would flood the queue and re-run WMI every poll cycle.
+        if force or added or removed:
             usb = self.enumerate_usb()
             payload = {
                 "volumes": current,

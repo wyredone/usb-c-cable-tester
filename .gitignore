@@ -24,3 +24,6 @@ env/
 # OS
 Thumbs.db
 Desktop.ini
+
+# Dev/test scaffolding
+test_harness.py
