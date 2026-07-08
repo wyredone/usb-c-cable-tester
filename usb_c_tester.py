@@ -55,7 +55,7 @@ import time
 import traceback
 import winsound
 from datetime import datetime
-from tkinter import ttk
+from tkinter import ttk, filedialog, messagebox
 
 try:
     from zoneinfo import ZoneInfo
@@ -89,6 +89,85 @@ COLOR = {
     "amber": "#d38b12",
     "amber_hi": "#f0a52a",
 }
+
+
+# ----------------------------------------------------------------------------
+# USB-IF vendor lookup (offline).  Maps a 4-hex VID -> vendor name so devices
+# show a friendly maker instead of a bare number.  A compact built-in table
+# covers common vendors (and the ones relevant to automotive/dev hardware);
+# it can be extended at runtime by dropping a `usb_ids.json` next to the app
+# ({"2207": "Fuzhou Rockchip Electronics Co., Ltd", ...}) -- entries there
+# override/extend the built-ins.
+# ----------------------------------------------------------------------------
+USB_VENDORS = {
+    "0403": "FTDI",
+    "0424": "Microchip / SMSC",
+    "045e": "Microsoft",
+    "046d": "Logitech",
+    "04a9": "Canon",
+    "04b8": "Epson",
+    "04e8": "Samsung",
+    "0502": "Acer",
+    "05ac": "Apple",
+    "05e3": "Genesys Logic (USB hub)",
+    "0630": "Autel",
+    "0644": "TEAC",
+    "067b": "Prolific",
+    "0951": "Kingston",
+    "0b05": "ASUS",
+    "0bda": "Realtek",
+    "0c45": "Microdia",
+    "0e0f": "VMware",
+    "1004": "LG Electronics",
+    "10c4": "Silicon Labs (CP210x)",
+    "1050": "Yubico",
+    "12d1": "Huawei",
+    "13fe": "Kingston / Phison",
+    "1532": "Razer",
+    "152d": "JMicron (USB-SATA bridge)",
+    "1546": "u-blox",
+    "18d1": "Google",
+    "1a40": "Terminus (USB hub)",
+    "1a86": "QinHeng (CH340/CH341)",
+    "1b1c": "Corsair",
+    "1bcf": "Sunplus / Sonix",
+    "1d6b": "Linux Foundation (root hub)",
+    "2109": "VIA Labs (USB hub)",
+    "2207": "Fuzhou Rockchip Electronics Co., Ltd",
+    "22b8": "Motorola",
+    "2717": "Xiaomi",
+    "273f": "Autel Intelligent Technology",
+    "2833": "Oculus / Meta",
+    "29a9": "Autel",
+    "2e04": "HMD Global (Nokia)",
+    "8087": "Intel",
+    "8564": "Transcend",
+    "90c3": "MediaTek",
+    "18a5": "Verbatim",
+}
+
+
+def _load_vendor_overrides():
+    """Merge an optional external usb_ids.json (VID->name) over the built-ins."""
+    path = os.path.join(APP_DIR, "usb_ids.json")
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                for k, v in data.items():
+                    if isinstance(k, str) and isinstance(v, str):
+                        USB_VENDORS[k.lower().replace("0x", "").strip()] = v
+    except Exception:
+        pass
+
+
+def vendor_name(vid):
+    """Return a friendly vendor name for a 4-hex VID string, or None."""
+    if not vid:
+        return None
+    key = str(vid).lower().replace("0x", "").strip()
+    return USB_VENDORS.get(key)
 
 
 # ----------------------------------------------------------------------------
@@ -305,6 +384,7 @@ class DetectionEngine(threading.Thread):
                         "name": dev.Name or "Unknown",
                         "vid": vid,
                         "pid": pid,
+                        "vendor": vendor_name(vid),
                         "device_id": did,
                     }
                 )
@@ -486,6 +566,7 @@ class DetectionEngine(threading.Thread):
                             "shell_path": path,
                             "vid": vid,
                             "pid": pid,
+                            "vendor": vendor_name(vid),
                         }
                     )
                 except Exception as e:
@@ -646,6 +727,163 @@ class DetectionEngine(threading.Thread):
 
 
 # ----------------------------------------------------------------------------
+# Report / chart rendering (Pillow).  No external chart libs -- we draw the
+# throughput-vs-size curve and the pass/fail report card by hand so the app
+# stays a single dependency-light file.
+# ----------------------------------------------------------------------------
+def _fit_font(size):
+    """Best-effort TrueType font; fall back to Pillow's bitmap default."""
+    from PIL import ImageFont
+    for name in ("segoeui.ttf", "arial.ttf", "DejaVuSans.ttf"):
+        try:
+            return ImageFont.truetype(name, size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+
+def _text_size(draw, text, font):
+    try:
+        b = draw.textbbox((0, 0), text, font=font)
+        return b[2] - b[0], b[3] - b[1]
+    except Exception:
+        return draw.textsize(text, font=font)
+
+
+def render_sweep_chart(sweep, out_path, title="Throughput vs Transfer Size"):
+    """Render a line chart of write/read MB/s across transfer sizes.
+
+    sweep: list of {"size_mb", "write", "read"}. Returns out_path.
+    """
+    W, H = 900, 520
+    ml, mr, mt, mb = 90, 40, 70, 70          # plot margins
+    img = Image.new("RGB", (W, H), "#1b1b1b")
+    d = ImageDraw.Draw(img)
+    f_title = _fit_font(26)
+    f_lbl = _fit_font(15)
+    f_sm = _fit_font(13)
+
+    d.text((ml, 22), title, fill="#ffffff", font=f_title)
+    px0, py0 = ml, mt
+    px1, py1 = W - mr, H - mb
+
+    pts = [s for s in sweep if isinstance(s.get("size_mb"), (int, float))]
+    max_speed = max([1.0] + [max(s["write"], s["read"]) for s in pts]) if pts else 1.0
+    max_speed *= 1.15
+    n = len(pts)
+
+    # axes
+    d.line([(px0, py0), (px0, py1)], fill="#888888", width=2)
+    d.line([(px0, py1), (px1, py1)], fill="#888888", width=2)
+
+    # y gridlines / labels (5 steps)
+    for i in range(6):
+        yv = max_speed * i / 5.0
+        y = py1 - (py1 - py0) * (i / 5.0)
+        d.line([(px0, y), (px1, y)], fill="#333333", width=1)
+        lab = f"{yv:.0f}"
+        tw, th = _text_size(d, lab, f_sm)
+        d.text((px0 - 10 - tw, y - th / 2), lab, fill="#bbbbbb", font=f_sm)
+    d.text((px0 - 60, py0 - 34), "MB/s", fill="#dddddd", font=f_lbl)
+
+    def xy(idx, speed):
+        x = px0 if n <= 1 else px0 + (px1 - px0) * (idx / (n - 1))
+        y = py1 - (py1 - py0) * (speed / max_speed)
+        return x, y
+
+    # x labels
+    for idx, s in enumerate(pts):
+        x, _ = xy(idx, 0)
+        lab = f"{s['size_mb']} MB"
+        tw, th = _text_size(d, lab, f_sm)
+        d.text((x - tw / 2, py1 + 8), lab, fill="#bbbbbb", font=f_sm)
+
+    def plot(series_key, color):
+        last = None
+        for idx, s in enumerate(pts):
+            x, y = xy(idx, s.get(series_key, 0) or 0)
+            if last is not None:
+                d.line([last, (x, y)], fill=color, width=3)
+            d.ellipse([x - 4, y - 4, x + 4, y + 4], fill=color)
+            last = (x, y)
+
+    plot("write", "#f0a52a")   # amber = write
+    plot("read", "#27c06a")    # green = read
+
+    # legend
+    lx, ly = px1 - 180, py0 + 6
+    d.rectangle([lx, ly, lx + 16, ly + 12], fill="#27c06a")
+    d.text((lx + 22, ly - 2), "Read", fill="#dddddd", font=f_sm)
+    d.rectangle([lx, ly + 22, lx + 16, ly + 34], fill="#f0a52a")
+    d.text((lx + 22, ly + 20), "Write", fill="#dddddd", font=f_sm)
+
+    img.save(out_path, "PNG")
+    return out_path
+
+
+def render_report_card(info, out_path):
+    """Render a cable pass/fail report card PNG.
+
+    info keys: verdict, verdict_color ('green'|'amber'|'red'), device,
+    generation, write, read, rand4k, mode, timestamp, notes (list[str]).
+    Returns out_path.
+    """
+    W, H = 900, 560
+    img = Image.new("RGB", (W, H), "#1b1b1b")
+    d = ImageDraw.Draw(img)
+    f_h = _fit_font(30)
+    f_v = _fit_font(40)
+    f_k = _fit_font(17)
+    f_val = _fit_font(24)
+    f_sm = _fit_font(14)
+
+    band = COLOR.get(info.get("verdict_color", "idle"), COLOR["idle"])
+    d.rectangle([0, 0, W, 96], fill=band)
+    d.text((30, 20), "USB-C Cable Test Report", fill="#ffffff", font=f_h)
+    verdict = info.get("verdict", "\u2014")
+    d.text((30, 116), verdict, fill=band, font=f_v)
+
+    rows = [
+        ("Far-end device", info.get("device", "\u2014")),
+        ("USB generation", info.get("generation", "\u2014")),
+        ("Mode", info.get("mode", "\u2014")),
+        ("Timestamp", info.get("timestamp", "\u2014")),
+    ]
+    y = 190
+    for k, v in rows:
+        d.text((30, y), k, fill="#9a9a9a", font=f_k)
+        d.text((300, y - 2), str(v), fill="#ffffff", font=f_k)
+        y += 34
+
+    # speed boxes
+    y += 6
+    boxes = [
+        ("Write", info.get("write"), "#f0a52a"),
+        ("Read", info.get("read"), "#27c06a"),
+        ("4K rnd", info.get("rand4k"), "#4aa3df"),
+    ]
+    bx = 30
+    for label, val, col in boxes:
+        d.rectangle([bx, y, bx + 260, y + 110], outline=col, width=3)
+        d.text((bx + 16, y + 12), label, fill="#bbbbbb", font=f_k)
+        txt = "n/a" if val is None else f"{val}"
+        d.text((bx + 16, y + 44), txt, fill=col, font=f_val)
+        d.text((bx + 16, y + 82), "MB/s" if val is not None else "", fill="#888888", font=f_sm)
+        bx += 285
+
+    # notes
+    ny = y + 130
+    for note in (info.get("notes") or [])[:4]:
+        d.text((30, ny), "\u2022 " + note, fill="#cccccc", font=f_sm)
+        ny += 22
+
+    d.text((30, H - 30), "Generated by USB-C Cable Tester v" + APP_VERSION,
+           fill="#666666", font=f_sm)
+    img.save(out_path, "PNG")
+    return out_path
+
+
+# ----------------------------------------------------------------------------
 # Benchmark (4K random + 1M sequential, warm-up + 3 runs, capped, throttling)
 # ----------------------------------------------------------------------------
 class Benchmark:
@@ -763,6 +1001,79 @@ class Benchmark:
                     os.remove(tmp)
             except Exception as e:
                 self.log.exc("benchmark_cleanup", e)
+
+    # Default sizes (MB) for the multi-size throughput sweep.
+    SWEEP_SIZES = (4, 16, 64, 256)
+
+    def run_sweep(self, mountpoint, sizes=None, progress_cb=None):
+        """Run a multi-size sequential write/read sweep on a mass-storage volume.
+
+        Small transfers are dominated by per-op overhead and OS caching; large
+        transfers expose sustained media speed and any cache cliff. Running a
+        range of sizes therefore reveals the throughput-vs-size curve, which is
+        the honest picture of a cable+device pair. Returns:
+            {"sweep": [{"size_mb", "write", "read"}...], "sizes": [...]}
+        or {"error": ...} on failure.
+        """
+        if progress_cb is None:
+            progress_cb = lambda _m: None
+        sizes = list(sizes or self.SWEEP_SIZES)
+        free_mb = self._free_mb(mountpoint)
+        # Never let a single sample exceed half the free space.
+        cap = max(4, int(free_mb * 0.5)) if free_mb else max(sizes)
+        sizes = [s for s in sizes if s <= cap] or [min(sizes)]
+        block_1m = 1024 * 1024
+        result = {"sweep": [], "sizes": sizes}
+        # Overall time cap so a slow stick can't hang the UI thread's worker.
+        deadline = time.time() + 40.0
+        try:
+            for idx, size_mb in enumerate(sizes):
+                if time.time() > deadline:
+                    self.log.event("WARN", "sweep_time_cap_hit", {"size": size_mb})
+                    break
+                tmp = os.path.join(mountpoint, f".usb_sweep_{stamp_file()}_{size_mb}.tmp")
+                data = os.urandom(block_1m)
+                # --- write ---
+                progress_cb(f"Sweep {idx + 1}/{len(sizes)}: {size_mb} MB write...")
+                t0 = time.time()
+                written = 0
+                with open(tmp, "wb", buffering=0) as f:
+                    while written < size_mb * block_1m:
+                        f.write(data)
+                        written += block_1m
+                        if time.time() > deadline:
+                            break
+                    f.flush()
+                    os.fsync(f.fileno())
+                wt = time.time() - t0
+                w_mbps = (written / block_1m) / wt if wt > 0 else 0
+                # --- read (drop OS cache influence by reopening unbuffered) ---
+                progress_cb(f"Sweep {idx + 1}/{len(sizes)}: {size_mb} MB read...")
+                t0 = time.time()
+                read = 0
+                with open(tmp, "rb", buffering=0) as f:
+                    while True:
+                        chunk = f.read(block_1m)
+                        if not chunk:
+                            break
+                        read += len(chunk)
+                        if time.time() > deadline:
+                            break
+                rt = time.time() - t0
+                r_mbps = (read / block_1m) / rt if rt > 0 else 0
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
+                result["sweep"].append(
+                    {"size_mb": size_mb, "write": w_mbps, "read": r_mbps}
+                )
+            self.log.event("INFO", "sweep_complete", result)
+            return result
+        except Exception as e:
+            self.log.exc("run_sweep", e)
+            result["error"] = str(e)
+            return result
 
     # Max seconds to wait for a pushed file to appear before treating the write
     # as refused (leaves budget for the read-only fallback). Overridable.
@@ -928,6 +1239,67 @@ class Benchmark:
                 continue
         return _best[0]
 
+    def _collect_candidate_files(self, folder, deadline, limit=40, depth=0,
+                                 maxdepth=5, out=None):
+        """Collect up to `limit` candidate files from the device tree for the
+        pull-only read benchmark.
+
+        MTP frequently reports Size==0 for real files, so we CANNOT trust the
+        reported size to pick a good file. Instead we gather many candidates
+        and let the caller actually pull them (largest reported first, but
+        Size==0 files are still tried) until one yields enough real bytes to
+        time. Returns a list of (shell_item, reported_size, name).
+        """
+        top = out is None
+        if out is None:
+            out = []
+        if time.time() > deadline or depth > maxdepth or len(out) >= limit:
+            return out
+        try:
+            items = folder.Items()
+        except Exception:
+            return out
+        subfolders = []
+        for it in items:
+            if time.time() > deadline or len(out) >= limit:
+                break
+            try:
+                if getattr(it, "IsFolder", False):
+                    subfolders.append(it)
+                    continue
+                try:
+                    sz = int(getattr(it, "Size", 0) or 0)
+                except Exception:
+                    sz = 0
+                nm = getattr(it, "Name", "file")
+                out.append((it, sz, nm))
+            except Exception:
+                continue
+        for sf in subfolders:
+            if time.time() > deadline or len(out) >= limit:
+                break
+            try:
+                child = sf.GetFolder
+                if child is not None:
+                    self._collect_candidate_files(
+                        child, deadline, limit, depth + 1, maxdepth, out)
+            except Exception:
+                continue
+        if top:
+            # Order: reported in-band first (best), then larger reported sizes,
+            # then Size==0 (unknown -- worth trying), tiny known-small last.
+            def rank(t):
+                _, sz, _ = t
+                if self.MTP_READ_MIN_BYTES <= sz <= self.MTP_READ_MAX_BYTES:
+                    return (0, -sz)
+                if sz == 0:
+                    return (1, 0)                     # unknown size, try it
+                if sz > self.MTP_READ_MAX_BYTES:
+                    return (2, -sz)                   # big, but capped by timer
+                return (3, -sz)                       # known-small, last resort
+            out.sort(key=rank)
+        return out
+
     def run_mtp(self, mtp_name, target_mb, progress_cb):
         """Copy-based transfer benchmark for an MTP device (Autel/Rockchip,
         phones, etc.).
@@ -991,7 +1363,10 @@ class Benchmark:
             # doesn't starve the read-only fallback. The last candidate gets
             # whatever is left.
             n = len(candidates)
-            per = max(3.0, self.MTP_WRITE_WAIT_S / n)
+            # Per-candidate slice. Floor is normally 3s so a slow-but-willing
+            # folder isn't cut off, but never exceed the total write budget --
+            # this lets tests shrink MTP_WRITE_WAIT_S to run fast.
+            per = min(self.MTP_WRITE_WAIT_S, max(3.0, self.MTP_WRITE_WAIT_S / n))
             tried = []
             for idx, (cand_folder, cand_path) in enumerate(candidates):
                 progress_cb(f"MTP push (write) to '{cand_path}'...")
@@ -1033,78 +1408,118 @@ class Benchmark:
             pull_dir = tempfile.mkdtemp(prefix="usb_mtp_pull_")
             dst_folder = shell.NameSpace(pull_dir)
 
-            # Case A: our pushed file made it -> pull it back (round-trip).
-            src_on_device = None
-            expected_mb = size_mb
-            if write_mbps > 0:
+            # A single robust pull helper: copy one shell item into pull_dir,
+            # wait for the local file to finish, and return the real bytes and
+            # elapsed seconds. Because MTP lies about Size, we trust ONLY the
+            # bytes that actually land on disk.
+            def _pull_and_measure(item, name, expect_mb):
+                target = os.path.join(pull_dir, name)
+                # Clear any stale copy so we measure a fresh pull.
                 try:
-                    src_on_device = write_folder.ParseName(pushed_name)
+                    if os.path.exists(target):
+                        os.remove(target)
                 except Exception:
-                    src_on_device = None
-
-            # Case B: write failed -> find an existing file on the device to
-            # measure read throughput anyway (pull-only fallback).
-            pulled_name = pushed_name
-            if src_on_device is None:
-                existing = self._find_existing_file(device_folder, deadline)
-                if existing is not None:
-                    src_on_device = existing
-                    pulled_name = getattr(existing, "Name", "pulled.bin")
-                    try:
-                        esz = int(getattr(existing, "Size", 0) or 0)
-                        expected_mb = max(0.001, esz / (1024 * 1024)) if esz else None
-                    except Exception:
-                        expected_mb = None
-                    read_note = "Read-only: pulled existing file '%s'." % pulled_name[:40]
-
-            if src_on_device is not None:
+                    pass
                 t0 = time.time()
-                dst_folder.CopyHere(src_on_device, FLAGS)
-                pulled = os.path.join(pull_dir, pulled_name)
-                # Poll finely and wait for the local file size to STABILISE
-                # (two identical reads) or hit the expected size, so small/fast
-                # copies still get an accurate elapsed time.
+                try:
+                    dst_folder.CopyHere(item, FLAGS)
+                except Exception:
+                    return 0, 0.0, target
                 last_sz = -1
                 stable = 0
-                got_bytes = 0
-                while time.time() < deadline:
-                    if os.path.exists(pulled):
-                        cur = os.path.getsize(pulled)
-                        if expected_mb is not None and \
-                                cur >= expected_mb * 1024 * 1024 * 0.98:
-                            got_bytes = cur
+                got = 0
+                # Per-file cap so one stuck file can't eat the whole budget.
+                fdeadline = min(deadline, t0 + 15.0)
+                while time.time() < fdeadline:
+                    if os.path.exists(target):
+                        cur = os.path.getsize(target)
+                        if expect_mb is not None and \
+                                cur >= expect_mb * 1024 * 1024 * 0.98:
+                            got = cur
                             break
                         if cur > 0 and cur == last_sz:
                             stable += 1
-                            if stable >= 2:   # size held across polls -> done
-                                got_bytes = cur
+                            if stable >= 2:
+                                got = cur
                                 break
                         else:
                             stable = 0
                         last_sz = cur
                     time.sleep(0.05)
                 rt = time.time() - t0
-                if got_bytes == 0 and os.path.exists(pulled):
-                    got_bytes = os.path.getsize(pulled)
-                got_mb = got_bytes / (1024 * 1024)
-                # A file smaller than ~0.5 MB copies faster than we can time
-                # reliably; report it honestly instead of a bogus 0/near-0.
-                if got_bytes:
-                    read_confirmed = True
-                if got_bytes and got_bytes < 512 * 1024:
-                    read_mbps = 0
-                    read_note = (
-                        (read_note or "") +
-                        " File too small (%.0f KB) to measure read speed "
-                        "reliably; data path confirmed." % (got_bytes / 1024.0)
-                    ).strip()
-                elif rt > 0 and got_mb > 0:
-                    read_mbps = got_mb / rt
+                if got == 0 and os.path.exists(target):
+                    got = os.path.getsize(target)
+                return got, rt, target
+
+            # Case A: our pushed file made it -> pull it back (round-trip).
+            MEASURABLE = 512 * 1024   # need >=0.5 MB pulled to time reliably
+            if write_mbps > 0:
                 try:
-                    if os.path.exists(pulled):
-                        os.remove(pulled)
+                    src_on_device = write_folder.ParseName(pushed_name)
                 except Exception:
-                    pass
+                    src_on_device = None
+                if src_on_device is not None:
+                    got_bytes, rt, target = _pull_and_measure(
+                        src_on_device, pushed_name, size_mb)
+                    if got_bytes:
+                        read_confirmed = True
+                    if got_bytes >= MEASURABLE and rt > 0:
+                        read_mbps = (got_bytes / (1024 * 1024)) / rt
+                    try:
+                        if os.path.exists(target):
+                            os.remove(target)
+                    except Exception:
+                        pass
+
+            # Case B: no measurable round-trip read yet -> walk the device for
+            # existing files and PULL them (largest reported first, Size==0
+            # included) until one yields enough real bytes to time. This beats
+            # MTP's bogus Size==0 that previously made us grab a 0 KB '.config'.
+            if read_mbps == 0:
+                progress_cb("Read-only: scanning device for a file to measure...")
+                candidates = self._collect_candidate_files(device_folder, deadline)
+                tried_names = []
+                best_small = None   # (bytes, name) largest sub-threshold pull
+                for item, rep_sz, nm in candidates:
+                    if time.time() > deadline - 2.0:
+                        break
+                    safe_nm = nm if nm else "pulled.bin"
+                    expect = (rep_sz / (1024 * 1024)) if rep_sz else None
+                    got_bytes, rt, target = _pull_and_measure(item, safe_nm, expect)
+                    tried_names.append(safe_nm[:30])
+                    if got_bytes:
+                        read_confirmed = True
+                    if got_bytes >= MEASURABLE and rt > 0:
+                        read_mbps = (got_bytes / (1024 * 1024)) / rt
+                        pulled_name = safe_nm
+                        read_note = ("Read-only: measured pull of existing file "
+                                     "'%s' (%.1f MB)." % (safe_nm[:40],
+                                                          got_bytes / 1048576.0))
+                        try:
+                            if os.path.exists(target):
+                                os.remove(target)
+                        except Exception:
+                            pass
+                        break
+                    # keep track of the largest tiny file as a last-resort proof
+                    if got_bytes and (best_small is None or got_bytes > best_small[0]):
+                        best_small = (got_bytes, safe_nm)
+                    try:
+                        if os.path.exists(target):
+                            os.remove(target)
+                    except Exception:
+                        pass
+                if read_mbps == 0 and best_small is not None:
+                    read_note = (
+                        "Read-only: pulled '%s' but the largest available file "
+                        "was only %.0f KB -- too small to measure a reliable "
+                        "speed; data path confirmed." % (
+                            best_small[1][:40], best_small[0] / 1024.0)
+                    )
+                elif read_mbps == 0 and not read_confirmed:
+                    read_note = ("Read-only: no readable file found on device "
+                                 "(tried %d)." % len(tried_names))
+
             try:
                 os.rmdir(pull_dir)
             except Exception:
@@ -1159,6 +1574,573 @@ class Benchmark:
                 pythoncom.CoUninitialize()
             except Exception:
                 pass
+
+
+# ----------------------------------------------------------------------------
+# Device filesystem: recursive tree walk + copy engine (backup / restore)
+# ----------------------------------------------------------------------------
+class FSNode:
+    """One entry in a device/PC filesystem tree.
+
+    For MTP, `path` is the '/'-joined chain of Names from the device root
+    (never a real OS path -- MTP has no drive letter), and `size` may be the
+    bogus MTP-reported size (often 0). For mass storage, `path` is a real OS
+    absolute path and `size` is the true byte count from os.stat.
+
+    `_shell` holds the COM shell item for MTP nodes so the copy engine can
+    pull/push them via Explorer's CopyHere; it is None for mass-storage nodes.
+    """
+
+    __slots__ = ("name", "path", "is_folder", "size", "children", "kind",
+                 "_shell")
+
+    def __init__(self, name, path, is_folder, size=0, kind="mass", shell=None):
+        self.name = name
+        self.path = path
+        self.is_folder = is_folder
+        self.size = int(size or 0)
+        self.children = []          # list[FSNode]
+        self.kind = kind            # "mtp" or "mass"
+        self._shell = shell         # COM item (MTP only)
+
+    def add(self, child):
+        self.children.append(child)
+        return child
+
+    def iter_files(self):
+        """Yield all file (non-folder) descendants, depth-first."""
+        for c in self.children:
+            if c.is_folder:
+                for f in c.iter_files():
+                    yield f
+            else:
+                yield c
+
+    def count(self):
+        """(n_files, n_folders, total_reported_bytes) over the whole subtree."""
+        nf = nd = 0
+        tot = 0
+        for c in self.children:
+            if c.is_folder:
+                nd += 1
+                sf, sd, st = c.count()
+                nf += sf
+                nd += sd
+                tot += st
+            else:
+                nf += 1
+                tot += c.size
+        return nf, nd, tot
+
+    def to_dict(self):
+        return {
+            "name": self.name,
+            "path": self.path,
+            "is_folder": self.is_folder,
+            "size": self.size,
+            "kind": self.kind,
+            "children": [c.to_dict() for c in self.children],
+        }
+
+
+class DeviceFS:
+    """Recursive filesystem walker for connected devices.
+
+    Two backends:
+      * mass storage  -> os.scandir / os.stat (real drive letter or mount)
+      * MTP           -> Shell.Application WPD namespace (no drive letter)
+
+    A walk returns a single root FSNode whose children are the top-level
+    entries. Locked scope is a FULL scan up front, so `recurse=True` descends
+    the entire tree; `recurse=False` lists only the top level.
+    """
+
+    # Safety rails so a pathological device can't hang or explode the tree.
+    MAX_ENTRIES = 200000
+    MAX_DEPTH = 40
+
+    def __init__(self, logger):
+        self.log = logger
+        self._count = 0
+
+    # ---- mass storage --------------------------------------------------
+    def walk_mass(self, mountpoint, recurse=True, progress_cb=None):
+        progress_cb = progress_cb or (lambda m: None)
+        root_name = mountpoint.rstrip("\\/") or mountpoint
+        root = FSNode(root_name, mountpoint, True, 0, kind="mass")
+        self._count = 0
+        try:
+            self._walk_mass_into(root, recurse, 0, progress_cb)
+        except Exception as e:
+            self.log.exc("walk_mass", e)
+        nf, nd, tot = root.count()
+        self.log.event("INFO", "devfs_walk_mass",
+                       {"mount": mountpoint, "files": nf, "folders": nd,
+                        "bytes": tot, "recurse": recurse})
+        return root
+
+    def _walk_mass_into(self, node, recurse, depth, progress_cb):
+        if depth > self.MAX_DEPTH or self._count >= self.MAX_ENTRIES:
+            return
+        try:
+            entries = list(os.scandir(node.path))
+        except Exception:
+            return
+        # Folders first, then files, both alphabetical -- stable GUI order.
+        entries.sort(key=lambda e: (not e.is_dir(follow_symlinks=False),
+                                    e.name.lower()))
+        for e in entries:
+            if self._count >= self.MAX_ENTRIES:
+                break
+            try:
+                is_dir = e.is_dir(follow_symlinks=False)
+            except Exception:
+                is_dir = False
+            if is_dir:
+                child = node.add(FSNode(e.name, e.path, True, 0, kind="mass"))
+                self._count += 1
+                if self._count % 500 == 0:
+                    progress_cb("Scanning %s (%d entries)..."
+                                % (node.name, self._count))
+                if recurse:
+                    self._walk_mass_into(child, recurse, depth + 1, progress_cb)
+            else:
+                try:
+                    sz = e.stat(follow_symlinks=False).st_size
+                except Exception:
+                    sz = 0
+                node.add(FSNode(e.name, e.path, False, sz, kind="mass"))
+                self._count += 1
+
+    # ---- MTP -----------------------------------------------------------
+    def walk_mtp(self, mtp_name, recurse=True, progress_cb=None):
+        progress_cb = progress_cb or (lambda m: None)
+        root = FSNode(mtp_name, mtp_name, True, 0, kind="mtp")
+        try:
+            import win32com.client
+            import pythoncom
+            pythoncom.CoInitialize()
+            try:
+                shell = win32com.client.Dispatch("Shell.Application")
+                this_pc = shell.NameSpace(17)
+                device_item = None
+                if this_pc is not None:
+                    for item in this_pc.Items():
+                        if getattr(item, "Name", "") == mtp_name:
+                            device_item = item
+                            break
+                if device_item is None:
+                    self.log.event("WARN", "devfs_walk_mtp_notfound",
+                                   {"name": mtp_name})
+                    return root
+                device_folder = device_item.GetFolder
+                self._count = 0
+                self._walk_mtp_into(root, device_folder, recurse, 0, progress_cb)
+            finally:
+                try:
+                    pythoncom.CoUninitialize()
+                except Exception:
+                    pass
+        except Exception as e:
+            self.log.exc("walk_mtp", e)
+        nf, nd, tot = root.count()
+        self.log.event("INFO", "devfs_walk_mtp",
+                       {"name": mtp_name, "files": nf, "folders": nd,
+                        "bytes": tot, "recurse": recurse})
+        return root
+
+    def _walk_mtp_into(self, node, folder, recurse, depth, progress_cb):
+        if depth > self.MAX_DEPTH or self._count >= self.MAX_ENTRIES:
+            return
+        try:
+            items = folder.Items()
+        except Exception:
+            return
+        files = []
+        folders = []
+        for it in items:
+            if self._count >= self.MAX_ENTRIES:
+                break
+            try:
+                is_dir = bool(getattr(it, "IsFolder", False))
+            except Exception:
+                is_dir = False
+            nm = getattr(it, "Name", "item")
+            if is_dir:
+                folders.append((it, nm))
+            else:
+                try:
+                    sz = int(getattr(it, "Size", 0) or 0)
+                except Exception:
+                    sz = 0
+                files.append((it, nm, sz))
+        # Folders first (alpha), then files (alpha) for a stable tree.
+        folders.sort(key=lambda t: t[1].lower())
+        files.sort(key=lambda t: t[1].lower())
+        for it, nm in folders:
+            child_path = node.path + "/" + nm if node.path else nm
+            child = node.add(FSNode(nm, child_path, True, 0, kind="mtp",
+                                    shell=it))
+            self._count += 1
+            if self._count % 200 == 0:
+                progress_cb("Scanning device (%d entries)..." % self._count)
+            if recurse:
+                try:
+                    sub = it.GetFolder
+                    if sub is not None:
+                        self._walk_mtp_into(child, sub, recurse, depth + 1,
+                                            progress_cb)
+                except Exception:
+                    pass
+        for it, nm, sz in files:
+            child_path = node.path + "/" + nm if node.path else nm
+            node.add(FSNode(nm, child_path, False, sz, kind="mtp", shell=it))
+            self._count += 1
+
+
+BACKUP_LOG_DIR = os.path.join(APP_DIR, "backups")
+
+
+class CopyJob:
+    """A resumable copy plan: a flat list of file tasks plus the folders that
+    must exist. Persisted as a JSON manifest so an interrupted backup can be
+    resumed (locked scope: resume interrupted backups).
+
+    direction:
+        "device_to_pc"  -> pull from device to a local destination (backup)
+        "pc_to_device"  -> push from local source to the device (restore)
+    """
+
+    MANIFEST_VERSION = 1
+
+    def __init__(self, direction, device_name, dest_root, tasks, dirs,
+                 total_bytes, manifest_path):
+        self.direction = direction
+        self.device_name = device_name
+        self.dest_root = dest_root
+        self.tasks = tasks          # list[dict]: src, rel, size, done, bytes
+        self.dirs = dirs            # list[str] rel dir paths to pre-create
+        self.total_bytes = int(total_bytes or 0)
+        self.manifest_path = manifest_path
+        self.created = stamp_line()
+
+    def to_dict(self):
+        return {
+            "manifest_version": self.MANIFEST_VERSION,
+            "direction": self.direction,
+            "device_name": self.device_name,
+            "dest_root": self.dest_root,
+            "created": self.created,
+            "total_bytes": self.total_bytes,
+            "dirs": self.dirs,
+            "tasks": self.tasks,
+        }
+
+    def save(self):
+        try:
+            os.makedirs(os.path.dirname(self.manifest_path), exist_ok=True)
+            tmp = self.manifest_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.to_dict(), f, indent=2)
+            os.replace(tmp, self.manifest_path)
+        except Exception:
+            pass
+
+    @classmethod
+    def load(cls, manifest_path):
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        job = cls(d["direction"], d.get("device_name", ""), d["dest_root"],
+                  d["tasks"], d.get("dirs", []), d.get("total_bytes", 0),
+                  manifest_path)
+        job.created = d.get("created", job.created)
+        return job
+
+    def remaining_bytes(self):
+        return sum(t["size"] - t.get("bytes", 0)
+                   for t in self.tasks if not t.get("done"))
+
+    def done_bytes(self):
+        return sum(t.get("bytes", 0) for t in self.tasks)
+
+
+class CopyEngine:
+    """Executes a CopyJob device<->PC with progress, ETA, resume, and a
+    persistent per-backup log file. Runs synchronously; the GUI drives it on a
+    worker thread and receives updates via progress_cb.
+
+    progress_cb receives a dict each tick:
+        {phase, file, done_files, total_files, done_bytes, total_bytes,
+         rate_bps, eta_s, percent}
+    """
+
+    CHUNK = 1024 * 1024   # 1 MB for mass-storage copies
+
+    def __init__(self, logger):
+        self.log = logger
+        self._cancel = False
+        self._logf = None
+
+    def cancel(self):
+        self._cancel = True
+
+    # ---- planning ------------------------------------------------------
+    def plan_backup(self, device_name, selected_nodes, dest_root,
+                    manifest_path=None):
+        """Build a CopyJob to pull selected FSNodes (device -> PC).
+
+        `selected_nodes` are FSNode file/folder roots the user checked. The
+        relative path under dest_root mirrors each node's tree position using
+        its `path` (MTP '/'-joined or mass OS path made relative to its root).
+        """
+        tasks = []
+        dirs = set()
+        total = 0
+
+        def rel_for(node, base_prefix):
+            # Build a clean relative path from the node's own path.
+            p = node.path.replace("\\", "/")
+            if base_prefix and p.startswith(base_prefix):
+                p = p[len(base_prefix):]
+            return p.strip("/")
+
+        for root_node in selected_nodes:
+            # base_prefix strips everything above the selected node's parent so
+            # the selection's own name becomes the top of the backup tree.
+            parent = root_node.path.replace("\\", "/").rsplit("/", 1)[0] \
+                if "/" in root_node.path.replace("\\", "/") else ""
+            base_prefix = parent + "/" if parent else ""
+            if root_node.is_folder:
+                dirs.add(rel_for(root_node, base_prefix))
+                for f in root_node.iter_files():
+                    rel = rel_for(f, base_prefix)
+                    d = os.path.dirname(rel)
+                    if d:
+                        dirs.add(d)
+                    tasks.append({
+                        "kind": f.kind,
+                        "src": f.path,
+                        "rel": rel,
+                        "size": int(f.size or 0),
+                        "done": False,
+                        "bytes": 0,
+                    })
+                    total += int(f.size or 0)
+            else:
+                rel = rel_for(root_node, base_prefix)
+                d = os.path.dirname(rel)
+                if d:
+                    dirs.add(d)
+                tasks.append({
+                    "kind": root_node.kind,
+                    "src": root_node.path,
+                    "rel": rel,
+                    "size": int(root_node.size or 0),
+                    "done": False,
+                    "bytes": 0,
+                })
+                total += int(root_node.size or 0)
+
+        if manifest_path is None:
+            manifest_path = os.path.join(
+                BACKUP_LOG_DIR, "manifest_%s.json" % stamp_file())
+        return CopyJob("device_to_pc", device_name, dest_root, tasks,
+                       sorted(d for d in dirs if d), total, manifest_path)
+
+    # ---- execution -----------------------------------------------------
+    def run(self, job, progress_cb=None, mtp_pull=None):
+        """Execute (or resume) a CopyJob. `mtp_pull(src_path, dest_full)` is a
+        caller-provided function that performs one MTP file pull and returns
+        the real bytes written (needed because MTP requires the live COM shell,
+        which the GUI owns). For mass-storage tasks we copy directly here.
+        Returns a summary dict.
+        """
+        progress_cb = progress_cb or (lambda d: None)
+        self._cancel = False
+        self._open_log(job)
+        total_files = len(job.tasks)
+        total_bytes = job.total_bytes
+        done_files = sum(1 for t in job.tasks if t.get("done"))
+        done_bytes = job.done_bytes()
+        start = time.time()
+        base_done = done_bytes
+        errors = 0
+
+        # Pre-create destination directories (skips ones already there).
+        try:
+            os.makedirs(job.dest_root, exist_ok=True)
+            for rd in job.dirs:
+                os.makedirs(os.path.join(job.dest_root, rd), exist_ok=True)
+        except Exception as e:
+            self._logline("mkdir error: %s" % e)
+
+        self._logline("START %s '%s' -> '%s' (%d files, %s)"
+                      % (job.direction, job.device_name, job.dest_root,
+                         total_files, _human_bytes(total_bytes)))
+
+        for i, t in enumerate(job.tasks):
+            if self._cancel:
+                self._logline("CANCELLED after %d/%d files" % (i, total_files))
+                break
+            if t.get("done"):
+                continue
+            dest_full = os.path.join(job.dest_root, t["rel"])
+            try:
+                os.makedirs(os.path.dirname(dest_full), exist_ok=True)
+            except Exception:
+                pass
+            got = 0
+            try:
+                if t["kind"] == "mass":
+                    got = self._copy_mass(t["src"], dest_full, job,
+                                          base_done, start, total_bytes,
+                                          total_files, i, progress_cb)
+                else:
+                    # MTP file: delegate the actual pull to the GUI-owned shell.
+                    if mtp_pull is None:
+                        raise RuntimeError("no MTP pull handler")
+                    got = int(mtp_pull(t["src"], dest_full) or 0)
+                t["bytes"] = got
+                t["done"] = True
+                done_files += 1
+                done_bytes = base_done + sum(
+                    x.get("bytes", 0) for x in job.tasks
+                    if x.get("done") and x is not t) + got
+                self._logline("OK  %s (%s)" % (t["rel"], _human_bytes(got)))
+            except Exception as e:
+                errors += 1
+                t["done"] = False
+                self._logline("ERR %s : %s" % (t["rel"], e))
+            # Persist manifest every few files so a crash is resumable.
+            if (i + 1) % 5 == 0:
+                job.save()
+            self._emit(progress_cb, job, "file", t["rel"], done_files,
+                       total_files, base_done, start, total_bytes)
+
+        job.save()
+        elapsed = time.time() - start
+        moved = job.done_bytes()
+        rate = (moved - base_done) / elapsed if elapsed > 0 else 0
+        summary = {
+            "direction": job.direction,
+            "dest_root": job.dest_root,
+            "total_files": total_files,
+            "done_files": done_files,
+            "errors": errors,
+            "moved_bytes": moved,
+            "elapsed_s": elapsed,
+            "rate_bps": rate,
+            "cancelled": self._cancel,
+            "complete": done_files >= total_files and not self._cancel,
+            "manifest": job.manifest_path,
+        }
+        self._logline("DONE files=%d/%d errors=%d moved=%s in %.1fs (%s/s)"
+                      % (done_files, total_files, errors, _human_bytes(moved),
+                         elapsed, _human_bytes(rate)))
+        # A fully complete job can drop its manifest so it isn't offered for
+        # resume; an incomplete one keeps it.
+        if summary["complete"]:
+            try:
+                os.remove(job.manifest_path)
+            except Exception:
+                pass
+        self._close_log()
+        self.log.event("INFO", "backup_complete", summary)
+        return summary
+
+    def _copy_mass(self, src, dest_full, job, base_done, start, total_bytes,
+                   total_files, idx, progress_cb):
+        got = 0
+        with open(src, "rb") as fsrc, open(dest_full, "wb") as fdst:
+            while True:
+                if self._cancel:
+                    break
+                buf = fsrc.read(self.CHUNK)
+                if not buf:
+                    break
+                fdst.write(buf)
+                got += len(buf)
+                # Live per-chunk progress for big files.
+                cur_done = base_done + sum(
+                    x.get("bytes", 0) for x in job.tasks if x.get("done")) + got
+                self._emit(progress_cb, job, "copying",
+                           os.path.basename(dest_full), None, total_files,
+                           base_done, start, total_bytes, extra_done=cur_done)
+        return got
+
+    # ---- progress / ETA ------------------------------------------------
+    def _emit(self, progress_cb, job, phase, fname, done_files, total_files,
+              base_done, start, total_bytes, extra_done=None):
+        if extra_done is not None:
+            done_bytes = extra_done
+        else:
+            done_bytes = job.done_bytes()
+        elapsed = time.time() - start
+        moved = max(0, done_bytes - base_done)
+        rate = moved / elapsed if elapsed > 0.25 else 0
+        remain = max(0, total_bytes - done_bytes)
+        eta = (remain / rate) if rate > 0 else None
+        pct = (done_bytes / total_bytes * 100.0) if total_bytes else 0
+        try:
+            progress_cb({
+                "phase": phase,
+                "file": fname,
+                "done_files": done_files,
+                "total_files": total_files,
+                "done_bytes": done_bytes,
+                "total_bytes": total_bytes,
+                "rate_bps": rate,
+                "eta_s": eta,
+                "percent": pct,
+            })
+        except Exception:
+            pass
+
+    # ---- persistent log ------------------------------------------------
+    def _open_log(self, job):
+        try:
+            os.makedirs(BACKUP_LOG_DIR, exist_ok=True)
+            path = os.path.join(BACKUP_LOG_DIR, "backup_%s.log" % stamp_file())
+            self._logf = open(path, "a", encoding="utf-8")
+            self._log_path = path
+        except Exception:
+            self._logf = None
+
+    def _logline(self, msg):
+        line = "[%s] %s" % (stamp_line(), msg)
+        if self._logf:
+            try:
+                self._logf.write(line + "\n")
+                self._logf.flush()
+            except Exception:
+                pass
+
+    def _close_log(self):
+        if self._logf:
+            try:
+                self._logf.close()
+            except Exception:
+                pass
+            self._logf = None
+
+
+def _human_bytes(n):
+    n = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return "%.1f %s" % (n, unit) if unit != "B" else "%d B" % int(n)
+        n /= 1024.0
+
+
+def _human_eta(seconds):
+    if seconds is None:
+        return "--:--"
+    seconds = int(max(0, seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return "%d:%02d:%02d" % (h, m, s)
+    return "%d:%02d" % (m, s)
 
 
 # ----------------------------------------------------------------------------
@@ -1313,22 +2295,42 @@ class App(ctk.CTk):
             fg_color=COLOR["idle"], state="disabled", width=160,
         )
         self.btn_bench.grid(row=0, column=0, padx=6)
-        self.btn_batch = ctk.CTkButton(
-            controls, text="Batch Mode (next cable)", command=self._batch_mark, width=180
+        self.btn_sweep = ctk.CTkButton(
+            controls, text="Size Sweep", command=self._run_sweep,
+            fg_color=COLOR["idle"], state="disabled", width=120,
         )
-        self.btn_batch.grid(row=0, column=1, padx=6)
+        self.btn_sweep.grid(row=0, column=1, padx=6)
+        self.btn_report = ctk.CTkButton(
+            controls, text="Save Report", command=self._save_report,
+            fg_color=COLOR["idle"], state="disabled", width=120,
+        )
+        self.btn_report.grid(row=0, column=2, padx=6)
+        self.btn_batch = ctk.CTkButton(
+            controls, text="Batch (next cable)", command=self._batch_mark, width=150
+        )
+        self.btn_batch.grid(row=0, column=3, padx=6)
         self.btn_rescan = ctk.CTkButton(
             controls, text="Rescan", command=self._rescan, width=100
         )
-        self.btn_rescan.grid(row=0, column=2, padx=6)
-        self.btn_selftest = ctk.CTkButton(
-            controls, text="Self-Test (calibrate)", command=self._self_test, width=170
+        self.btn_rescan.grid(row=0, column=4, padx=6)
+        self.btn_browse = ctk.CTkButton(
+            controls, text="Browse / Backup", command=self._open_device_browser,
+            fg_color=COLOR["idle"], state="disabled", width=150,
         )
-        self.btn_selftest.grid(row=0, column=3, padx=6)
+        self.btn_browse.grid(row=0, column=5, padx=6)
+        self.btn_selftest = ctk.CTkButton(
+            controls, text="Self-Test", command=self._self_test, width=110
+        )
+        self.btn_selftest.grid(row=0, column=6, padx=6)
         self.chime_var = ctk.BooleanVar(value=self.cfg.get("chime", True))
         ctk.CTkCheckBox(controls, text="Chime", variable=self.chime_var).grid(
-            row=0, column=4, padx=6
+            row=0, column=7, padx=6
         )
+        # Holds the most recent benchmark result + context for report/export.
+        self.last_result = None
+        self.last_gen = None
+        self.last_device_label = None
+        self.last_sweep = None
 
         # History table
         hist_frame = ctk.CTkFrame(self)
@@ -1499,13 +2501,19 @@ class App(ctk.CTk):
         mtp = p.get("mtp_devices", [])
         if mtp:
             m0 = mtp[0]
+            ven = m0.get("vendor")
+            vtag = f" \u2014 {ven}" if ven else (
+                f" (VID {m0.get('vid')})" if m0.get("vid") else "")
             self.lbl_device.configure(
-                text=f"Far-end device: {m0['name'][:40]} ({m0.get('type')})"
+                text=f"Far-end device: {m0['name'][:40]} ({m0.get('type')}){vtag}"
             )
         elif usb:
             d = usb[0]
+            ven = d.get("vendor")
+            vtag = f" \u2014 {ven}" if ven else ""
             self.lbl_device.configure(
-                text=f"Far-end device: {d['name'][:40]} (VID {d.get('vid')}/PID {d.get('pid')})"
+                text=f"Far-end device: {d['name'][:40]} "
+                     f"(VID {d.get('vid')}/PID {d.get('pid')}){vtag}"
             )
         else:
             self.lbl_device.configure(text="Far-end device: \u2014")
@@ -1562,9 +2570,17 @@ class App(ctk.CTk):
                 self.tile_data.set("amber", "Inconclusive")
                 self._set_banner("amber", "Inconclusive \u2014 plug a data device on the far end")
             self.btn_bench.configure(state="disabled", fg_color=COLOR["idle"])
+            self.btn_sweep.configure(state="disabled", fg_color=COLOR["idle"])
+            self.btn_browse.configure(state="disabled", fg_color=COLOR["idle"])
             return
 
         kind = dev["kind"]
+        # Browse/Backup works for anything with a real filesystem: mass storage
+        # (drive letter) and MTP (WPD namespace). PTP/camera exposes no files.
+        if kind in ("mass_storage", "mtp"):
+            self.btn_browse.configure(state="normal", fg_color=COLOR["green"])
+        else:
+            self.btn_browse.configure(state="disabled", fg_color=COLOR["idle"])
         if kind == "mass_storage":
             self.data_capable = True
             self.current_mount = dev["mount"]
@@ -1572,6 +2588,8 @@ class App(ctk.CTk):
             self.tile_type.set("green", "Mass Storage")
             self.tile_data.set("green", "Data OK")
             self.btn_bench.configure(state="normal", fg_color=COLOR["green"])
+            # Size sweep needs real random-access file I/O -> mass storage only.
+            self.btn_sweep.configure(state="normal", fg_color=COLOR["green"])
             self._set_banner("green", f"Data-capable cable \u2014 volume at {dev['mount']}")
         elif kind == "mtp":
             self.data_capable = True
@@ -1580,6 +2598,7 @@ class App(ctk.CTk):
             self.tile_type.set("green", "MTP")
             self.tile_data.set("green", "Data OK (MTP)")
             self.btn_bench.configure(state="normal", fg_color=COLOR["green"])
+            self.btn_sweep.configure(state="disabled", fg_color=COLOR["idle"])
             self._set_banner("green", f"Data-capable cable \u2014 MTP device '{dev['mtp_name']}'")
         else:  # ptp
             self.data_capable = True
@@ -1588,6 +2607,7 @@ class App(ctk.CTk):
             self.tile_type.set("amber", "PTP (camera)")
             self.tile_data.set("amber", "Data (PTP only)")
             self.btn_bench.configure(state="disabled", fg_color=COLOR["idle"])
+            self.btn_sweep.configure(state="disabled", fg_color=COLOR["idle"])
             self._set_banner("amber", f"PTP/camera mode '{dev['mtp_name']}' \u2014 cable carries data, no file storage. Switch device to MTP/File Transfer.")
 
     # -- benchmark -----------------------------------------------------------
@@ -1616,6 +2636,12 @@ class App(ctk.CTk):
 
     def _benchmark_done(self, res, gen, calibrate):
         is_mtp = res.get("mode") == "MTP"
+        # Remember the latest result so "Save Report" can render it.
+        self.last_result = res
+        self.last_gen = gen
+        self.last_device_label = self.lbl_device.cget("text").replace(
+            "Far-end device: ", "")
+        self.btn_report.configure(state="normal", fg_color=COLOR["green"])
         # For MTP, a "not measurable" result is NOT a cable failure -- the cable
         # is still data-capable. Show it as amber/informational, not red.
         if res.get("error"):
@@ -1704,6 +2730,116 @@ class App(ctk.CTk):
             save_config(self.cfg)
             self._log_ui(f"Calibration saved: reference read {r:.0f} MB/s")
 
+    # -- size sweep (feature 6) ---------------------------------------------
+    def _run_sweep(self):
+        if not self.current_mount:
+            self._log_ui("Size sweep needs a mass-storage volume (drive letter).")
+            return
+        self.btn_sweep.configure(state="disabled", fg_color=COLOR["amber"], text="Sweeping...")
+        mount = self.current_mount
+        gen = self.lbl_gen.cget("text").replace("USB generation: ", "")
+
+        def worker():
+            def prog(msg):
+                self.after(0, lambda: self._log_ui(msg))
+            res = self.bench.run_sweep(mount, progress_cb=prog)
+            self.after(0, lambda: self._sweep_done(res, gen))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _sweep_done(self, res, gen):
+        self.btn_sweep.configure(state="normal", fg_color=COLOR["green"], text="Size Sweep")
+        if res.get("error"):
+            self._log_ui("Sweep error: " + res["error"])
+            return
+        sweep = res.get("sweep", [])
+        self.last_sweep = sweep
+        if not sweep:
+            self._log_ui("Sweep produced no samples.")
+            return
+        for s in sweep:
+            self._log_ui(
+                "Sweep %4d MB:  write %6.1f MB/s   read %6.1f MB/s"
+                % (s["size_mb"], s["write"], s["read"])
+            )
+        # Render the throughput-vs-size curve to a PNG next to the logs.
+        try:
+            out = os.path.join(LOG_DIR, f"sweep_{stamp_file()}.png")
+            os.makedirs(LOG_DIR, exist_ok=True)
+            render_sweep_chart(sweep, out, title=f"Throughput vs Size ({gen})")
+            self._log_ui("Saved sweep chart: " + out)
+            try:
+                os.startfile(out)  # noqa: E1101 (Windows)
+            except Exception:
+                pass
+        except Exception as e:
+            self._log_ui("Could not render sweep chart: " + str(e))
+
+    # -- report card (feature 11) -------------------------------------------
+    def _save_report(self):
+        res = self.last_result
+        if not res:
+            self._log_ui("Run a benchmark first, then Save Report.")
+            return
+        # Derive a plain-English verdict + color from the last result.
+        is_mtp = res.get("mode") == "MTP"
+        w = res.get("write", {}).get("avg", 0)
+        r = res.get("read", {}).get("avg", 0)
+        rnd = res.get("rand4k", {}).get("avg", 0)
+        notes = []
+        for k in ("target_path", "write_note", "read_note", "note", "error", "anomaly"):
+            v = res.get(k)
+            if v:
+                notes.append(str(v))
+        if res.get("error") and not is_mtp:
+            verdict, color = "FAIL", "red"
+        elif is_mtp:
+            if w == 0 and r == 0:
+                verdict, color = "PASS (MTP, data confirmed)", "green"
+            elif w == 0 and r > 0:
+                verdict, color = "PASS (MTP, read-only)", "green"
+            else:
+                verdict, color = "PASS (MTP)", "green"
+        elif r < 40:
+            verdict, color = "PASS (slow / USB 2.0 class)", "amber"
+        else:
+            verdict, color = "PASS", "green"
+
+        info = {
+            "verdict": verdict,
+            "verdict_color": color,
+            "device": self.last_device_label or "\u2014",
+            "generation": self.last_gen or "\u2014",
+            "mode": "MTP (copy-based)" if is_mtp else "Mass storage",
+            "timestamp": stamp_line(),
+            "write": None if (is_mtp and w == 0) else round(w, 1),
+            "read": None if (is_mtp and r == 0) else round(r, 1),
+            "rand4k": None if is_mtp else round(rnd, 1),
+            "notes": notes,
+        }
+        default_name = f"cable_report_{stamp_file()}.png"
+        try:
+            path = filedialog.asksaveasfilename(
+                title="Save cable report",
+                defaultextension=".png",
+                initialfile=default_name,
+                initialdir=APP_DIR,
+                filetypes=[("PNG image", "*.png")],
+            )
+        except Exception:
+            path = os.path.join(APP_DIR, default_name)
+        if not path:
+            return
+        try:
+            render_report_card(info, path)
+            self._log_ui("Saved report card: " + path)
+            try:
+                os.startfile(path)  # noqa: E1101 (Windows)
+            except Exception:
+                pass
+        except Exception as e:
+            self._log_ui("Could not render report: " + str(e))
+
     def _self_test(self):
         self._log_ui("Self-test: benchmarking current volume as reference.")
         self._run_benchmark(calibrate=True)
@@ -1717,6 +2853,24 @@ class App(ctk.CTk):
         self.tile_data.set("idle", "Idle")
         self.tile_speed.set("idle", "Idle")
         self._set_banner("idle", "Batch: waiting for next cable...")
+
+    def _open_device_browser(self):
+        """Open the filesystem browser / backup window for the selected device."""
+        if self.current_mount:
+            mode, mount, mtp = "mass", self.current_mount, None
+        elif self.mtp_target:
+            mode, mount, mtp = "mtp", None, self.mtp_target
+        else:
+            self._log_ui("Browse/Backup: no browsable device selected.")
+            return
+        try:
+            win = DeviceBrowserWindow(self, mode, mount, mtp, self.log)
+            win.focus()
+            self._log_ui("Opened Device Browser for %s"
+                         % (mtp or mount))
+        except Exception as e:
+            self.log.exc("open_device_browser", e)
+            self._log_ui("Could not open Device Browser: %s" % e)
 
     # -- history persistence -------------------------------------------------
     def _append_history(self, row):
@@ -1746,12 +2900,541 @@ class App(ctk.CTk):
         self.destroy()
 
 
+class DeviceBrowserWindow(ctk.CTkToplevel):
+    """Filesystem browser + backup/restore window for the connected device.
+
+    Shows the device tree with tri-state-ish checkboxes (folder check cascades
+    to children), a recurse toggle, a destination picker, a direction control
+    (Device -> PC backup / PC -> Device restore), a live progress bar with
+    ETA, and Resume support for interrupted backups. All heavy work (scan and
+    copy) runs on a worker thread so the UI stays responsive; MTP work creates
+    its own COM apartment on that thread.
+    """
+
+    def __init__(self, master, mode, mount, mtp_name, logger):
+        super().__init__(master)
+        self.master_app = master
+        self.mode = mode                 # "mass" or "mtp"
+        self.mount = mount
+        self.mtp_name = mtp_name
+        self.log = logger
+        self.devfs = DeviceFS(logger)
+        self.engine = CopyEngine(logger)
+
+        self.root_node = None
+        self._iid_to_node = {}           # treeview iid -> FSNode
+        self._checked = set()            # set of checked iids
+        self._worker = None
+        self._busy = False
+
+        dev_label = mtp_name if mode == "mtp" else mount
+        self.title("Device Browser \u2014 %s" % dev_label)
+        self.geometry("820x640")
+        self.minsize(720, 560)
+        self.transient(master)
+
+        self._build()
+        # Kick off the first scan shortly after the window is shown.
+        self.after(150, self._start_scan)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # -- layout ----------------------------------------------------------
+    def _build(self):
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(2, weight=1)
+
+        # Top bar: recurse toggle + direction + rescan
+        top = ctk.CTkFrame(self, fg_color="transparent")
+        top.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 4))
+        self.recurse_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(top, text="Recurse into subfolders",
+                        variable=self.recurse_var,
+                        command=self._start_scan).grid(row=0, column=0, padx=6)
+        ctk.CTkLabel(top, text="Direction:").grid(row=0, column=1, padx=(18, 4))
+        self.dir_var = ctk.StringVar(value="backup")
+        self.dir_menu = ctk.CTkSegmentedButton(
+            top, values=["Device \u2192 PC (backup)", "PC \u2192 Device (restore)"],
+            command=self._on_dir_change)
+        self.dir_menu.set("Device \u2192 PC (backup)")
+        self.dir_menu.grid(row=0, column=2, padx=6)
+        ctk.CTkButton(top, text="Rescan", width=90,
+                      command=self._start_scan).grid(row=0, column=3, padx=6)
+
+        # Selection helpers
+        selbar = ctk.CTkFrame(self, fg_color="transparent")
+        selbar.grid(row=1, column=0, sticky="ew", padx=12, pady=2)
+        ctk.CTkButton(selbar, text="Select all", width=90,
+                      command=lambda: self._check_all(True)).grid(row=0, column=0, padx=4)
+        ctk.CTkButton(selbar, text="Clear", width=70,
+                      command=lambda: self._check_all(False)).grid(row=0, column=1, padx=4)
+        self.sel_label = ctk.CTkLabel(selbar, text="0 selected")
+        self.sel_label.grid(row=0, column=2, padx=12)
+
+        # Tree
+        tree_frame = ctk.CTkFrame(self)
+        tree_frame.grid(row=2, column=0, sticky="nsew", padx=12, pady=6)
+        tree_frame.grid_columnconfigure(0, weight=1)
+        tree_frame.grid_rowconfigure(0, weight=1)
+        self.tree = ttk.Treeview(tree_frame, columns=("size",), show="tree headings")
+        self.tree.heading("#0", text="Name")
+        self.tree.heading("size", text="Size")
+        self.tree.column("#0", width=520, anchor="w")
+        self.tree.column("size", width=120, anchor="e")
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        vsb.grid(row=0, column=1, sticky="ns")
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.bind("<Button-1>", self._on_tree_click)
+        self.tree.bind("<space>", self._on_tree_space)
+
+        # Destination + actions
+        act = ctk.CTkFrame(self, fg_color="transparent")
+        act.grid(row=3, column=0, sticky="ew", padx=12, pady=4)
+        act.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(act, text="Destination:").grid(row=0, column=0, padx=4)
+        self.dest_var = ctk.StringVar(
+            value=os.path.join(APP_DIR, "backups", "out"))
+        self.dest_entry = ctk.CTkEntry(act, textvariable=self.dest_var)
+        self.dest_entry.grid(row=0, column=1, sticky="ew", padx=4)
+        ctk.CTkButton(act, text="Choose...", width=90,
+                      command=self._pick_dest).grid(row=0, column=2, padx=4)
+
+        # Progress
+        prog = ctk.CTkFrame(self, fg_color="transparent")
+        prog.grid(row=4, column=0, sticky="ew", padx=12, pady=4)
+        prog.grid_columnconfigure(0, weight=1)
+        self.progress = ctk.CTkProgressBar(prog)
+        self.progress.set(0)
+        self.progress.grid(row=0, column=0, sticky="ew", padx=4)
+        self.prog_label = ctk.CTkLabel(prog, text="Idle", width=280, anchor="w")
+        self.prog_label.grid(row=1, column=0, sticky="w", padx=4, pady=(2, 0))
+
+        # Bottom buttons
+        btns = ctk.CTkFrame(self, fg_color="transparent")
+        btns.grid(row=5, column=0, sticky="ew", padx=12, pady=(4, 12))
+        self.btn_start = ctk.CTkButton(btns, text="Start Backup", width=140,
+                                       command=self._start_transfer,
+                                       fg_color=COLOR["green"])
+        self.btn_start.grid(row=0, column=0, padx=4)
+        self.btn_cancel = ctk.CTkButton(btns, text="Cancel", width=90,
+                                        command=self._cancel_transfer,
+                                        state="disabled", fg_color=COLOR["amber"])
+        self.btn_cancel.grid(row=0, column=1, padx=4)
+        self.btn_resume = ctk.CTkButton(btns, text="Resume backup...", width=140,
+                                        command=self._resume_backup)
+        self.btn_resume.grid(row=0, column=2, padx=4)
+        ctk.CTkLabel(btns, text="Logs: %s" % BACKUP_LOG_DIR,
+                     text_color="#888888").grid(row=0, column=3, padx=12)
+
+    # -- direction -------------------------------------------------------
+    def _on_dir_change(self, value):
+        if value.startswith("Device"):
+            self.dir_var.set("backup")
+            self.btn_start.configure(text="Start Backup")
+            ttk_state = "normal"
+        else:
+            self.dir_var.set("restore")
+            self.btn_start.configure(text="Start Restore")
+        self._set_status("Direction: %s" % value)
+
+    # -- scanning --------------------------------------------------------
+    def _start_scan(self, *_):
+        if self._busy:
+            return
+        self._busy = True
+        self.tree.delete(*self.tree.get_children())
+        self._iid_to_node.clear()
+        self._checked.clear()
+        self._update_sel_label()
+        self._set_status("Scanning device...")
+        recurse = bool(self.recurse_var.get())
+        self._worker = threading.Thread(
+            target=self._scan_worker, args=(recurse,), daemon=True)
+        self._worker.start()
+
+    def _scan_worker(self, recurse):
+        try:
+            if self.mode == "mtp":
+                root = self.devfs.walk_mtp(self.mtp_name, recurse=recurse,
+                                           progress_cb=self._bg_status)
+            else:
+                root = self.devfs.walk_mass(self.mount, recurse=recurse,
+                                            progress_cb=self._bg_status)
+        except Exception as e:
+            self.log.exc("browser_scan", e)
+            root = None
+        self.after(0, lambda: self._scan_done(root))
+
+    def _scan_done(self, root):
+        self._busy = False
+        self.root_node = root
+        if root is None:
+            self._set_status("Scan failed (see logs).")
+            return
+        nf, nd, tot = root.count()
+        for child in root.children:
+            self._insert_node("", child)
+        self._set_status("Scanned: %d files, %d folders, %s"
+                         % (nf, nd, _human_bytes(tot)))
+
+    def _insert_node(self, parent_iid, node):
+        label = "[ ] " + node.name + ("/" if node.is_folder else "")
+        size_txt = "" if node.is_folder else _human_bytes(node.size)
+        iid = self.tree.insert(parent_iid, "end", text=label, values=(size_txt,),
+                               open=False)
+        self._iid_to_node[iid] = node
+        for child in node.children:
+            self._insert_node(iid, child)
+        return iid
+
+    # -- checkbox handling ----------------------------------------------
+    def _on_tree_click(self, event):
+        region = self.tree.identify("region", event.x, event.y)
+        if region not in ("tree", "cell"):
+            return
+        iid = self.tree.identify_row(event.y)
+        if not iid:
+            return
+        # Only toggle when the click lands on the checkbox glyph area (near the
+        # left of the label). Elsewhere in the row we let normal open/close and
+        # selection behavior happen.
+        elem = self.tree.identify_element(event.x, event.y)
+        if "text" in str(elem) or region == "tree":
+            # toggle if the click is on the left ~28px checkbox zone
+            bbox = self.tree.bbox(iid, "#0")
+            if bbox and event.x <= bbox[0] + 34:
+                self._toggle(iid)
+                return "break"
+
+    def _on_tree_space(self, event):
+        iid = self.tree.focus()
+        if iid:
+            self._toggle(iid)
+            return "break"
+
+    def _toggle(self, iid):
+        want = iid not in self._checked
+        self._set_check_recursive(iid, want)
+        self._update_sel_label()
+
+    def _set_check_recursive(self, iid, checked):
+        self._set_check(iid, checked)
+        for child in self.tree.get_children(iid):
+            self._set_check_recursive(child, checked)
+
+    def _set_check(self, iid, checked):
+        node = self._iid_to_node.get(iid)
+        if node is None:
+            return
+        if checked:
+            self._checked.add(iid)
+        else:
+            self._checked.discard(iid)
+        mark = "[x] " if checked else "[ ] "
+        name = node.name + ("/" if node.is_folder else "")
+        self.tree.item(iid, text=mark + name)
+
+    def _check_all(self, checked):
+        for iid in self._iid_to_node:
+            self._set_check(iid, checked)
+        self._update_sel_label()
+
+    def _update_sel_label(self):
+        # Count only file-leaf selections + selected-folder roots for the label.
+        n_files = 0
+        tot = 0
+        for iid in self._checked:
+            node = self._iid_to_node.get(iid)
+            if node and not node.is_folder:
+                n_files += 1
+                tot += node.size
+        self.sel_label.configure(text="%d files selected (%s)"
+                                  % (n_files, _human_bytes(tot)))
+
+    def _selected_roots(self):
+        """Return the top-most checked nodes (a checked folder subsumes its
+        checked children so we don't double-plan)."""
+        roots = []
+        for iid in self._checked:
+            node = self._iid_to_node.get(iid)
+            if node is None:
+                continue
+            parent = self.tree.parent(iid)
+            # If any ancestor is also checked, skip (it will carry this node).
+            anc = parent
+            covered = False
+            while anc:
+                if anc in self._checked:
+                    covered = True
+                    break
+                anc = self.tree.parent(anc)
+            if not covered:
+                roots.append(node)
+        return roots
+
+    # -- destination -----------------------------------------------------
+    def _pick_dest(self):
+        d = filedialog.askdirectory(title="Choose destination folder")
+        if d:
+            self.dest_var.set(d)
+
+    # -- transfer --------------------------------------------------------
+    def _start_transfer(self):
+        if self._busy:
+            return
+        direction = self.dir_var.get()
+        if direction == "restore":
+            messagebox.showinfo(
+                "Restore",
+                "Restore (PC \u2192 Device) copies a chosen PC folder onto the "
+                "device. Pick the SOURCE folder on your PC in the next dialog.")
+            src = filedialog.askdirectory(title="Choose PC source folder to restore")
+            if not src:
+                return
+            self._start_restore(src)
+            return
+
+        roots = self._selected_roots()
+        if not roots:
+            messagebox.showwarning("Nothing selected",
+                                   "Check at least one file or folder to back up.")
+            return
+        dest = self.dest_var.get().strip()
+        if not dest:
+            messagebox.showwarning("No destination", "Choose a destination folder.")
+            return
+        self._busy = True
+        self._set_buttons_running(True)
+        self.engine = CopyEngine(self.log)
+        self._worker = threading.Thread(
+            target=self._backup_worker, args=(roots, dest), daemon=True)
+        self._worker.start()
+
+    def _backup_worker(self, roots, dest):
+        try:
+            job = self.engine.plan_backup(
+                self.mtp_name or self.mount, roots, dest)
+            summary = self.engine.run(job, progress_cb=self._bg_progress,
+                                      mtp_pull=self._mtp_pull
+                                      if self.mode == "mtp" else None)
+        except Exception as e:
+            self.log.exc("backup_worker", e)
+            summary = {"error": str(e)}
+        self.after(0, lambda: self._transfer_done(summary))
+
+    def _start_restore(self, src):
+        # Restore = a plain PC->device copy. For mass storage we can copy into
+        # the mount directly; for MTP we push via the shell. Build a job whose
+        # source is the PC tree and dest_root is the device mount (mass only).
+        if self.mode == "mtp":
+            messagebox.showinfo(
+                "Restore to MTP",
+                "MTP restore pushes files through Windows Explorer. Large MTP "
+                "restores are best done by dragging in Explorer; this tool will "
+                "copy top-level files into the device's first writable folder.")
+        dest = self.mount if self.mode == "mass" else None
+        if dest is None:
+            messagebox.showwarning(
+                "Unsupported",
+                "Automated MTP restore isn't available; use Explorer for now.")
+            return
+        self._busy = True
+        self._set_buttons_running(True)
+        self.engine = CopyEngine(self.log)
+
+        def _worker():
+            try:
+                dfs = DeviceFS(self.log)
+                src_root = dfs.walk_mass(src, recurse=True)
+                job = self.engine.plan_backup("PC", [src_root], dest)
+                job.direction = "pc_to_device"
+                summary = self.engine.run(job, progress_cb=self._bg_progress)
+            except Exception as e:
+                self.log.exc("restore_worker", e)
+                summary = {"error": str(e)}
+            self.after(0, lambda: self._transfer_done(summary))
+
+        self._worker = threading.Thread(target=_worker, daemon=True)
+        self._worker.start()
+
+    def _mtp_pull(self, src_path, dest_full):
+        """Pull a single MTP file (identified by its '/'-joined device path)
+        into dest_full using a fresh COM apartment on this worker thread.
+        Returns the real bytes written."""
+        import win32com.client
+        import pythoncom
+        pythoncom.CoInitialize()
+        try:
+            shell = win32com.client.Dispatch("Shell.Application")
+            this_pc = shell.NameSpace(17)
+            device_item = None
+            for item in this_pc.Items():
+                if getattr(item, "Name", "") == self.mtp_name:
+                    device_item = item
+                    break
+            if device_item is None:
+                return 0
+            folder = device_item.GetFolder
+            parts = src_path.split("/")
+            # The first part is the device name itself; skip it.
+            if parts and parts[0] == self.mtp_name:
+                parts = parts[1:]
+            *dir_parts, fname = parts
+            for p in dir_parts:
+                nxt = folder.ParseName(p)
+                if nxt is None:
+                    return 0
+                folder = nxt.GetFolder
+            item = folder.ParseName(fname)
+            if item is None:
+                return 0
+            os.makedirs(os.path.dirname(dest_full), exist_ok=True)
+            pull_dir = os.path.dirname(dest_full)
+            dst = shell.NameSpace(pull_dir)
+            FLAGS = 16 + 4 + 512
+            target = dest_full
+            try:
+                if os.path.exists(target):
+                    os.remove(target)
+            except Exception:
+                pass
+            dst.CopyHere(item, FLAGS)
+            # Wait for the local file to settle.
+            deadline = time.time() + 60.0
+            last = -1
+            stable = 0
+            while time.time() < deadline:
+                if os.path.exists(target):
+                    cur = os.path.getsize(target)
+                    if cur > 0 and cur == last:
+                        stable += 1
+                        if stable >= 3:
+                            break
+                    else:
+                        stable = 0
+                    last = cur
+                time.sleep(0.1)
+            return os.path.getsize(target) if os.path.exists(target) else 0
+        finally:
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
+
+    def _cancel_transfer(self):
+        self.engine.cancel()
+        self._set_status("Cancelling...")
+
+    def _resume_backup(self):
+        mf = filedialog.askopenfilename(
+            title="Choose a backup manifest to resume",
+            initialdir=BACKUP_LOG_DIR,
+            filetypes=[("Backup manifest", "manifest_*.json"),
+                       ("JSON", "*.json"), ("All", "*.*")])
+        if not mf:
+            return
+        try:
+            job = CopyJob.load(mf)
+        except Exception as e:
+            messagebox.showerror("Resume failed", "Could not load manifest:\n%s" % e)
+            return
+        self._busy = True
+        self._set_buttons_running(True)
+        self.engine = CopyEngine(self.log)
+
+        def _worker():
+            try:
+                summary = self.engine.run(
+                    job, progress_cb=self._bg_progress,
+                    mtp_pull=self._mtp_pull if self.mode == "mtp" else None)
+            except Exception as e:
+                self.log.exc("resume_worker", e)
+                summary = {"error": str(e)}
+            self.after(0, lambda: self._transfer_done(summary))
+
+        self._set_status("Resuming backup from manifest...")
+        self._worker = threading.Thread(target=_worker, daemon=True)
+        self._worker.start()
+
+    def _transfer_done(self, summary):
+        self._busy = False
+        self._set_buttons_running(False)
+        if summary.get("error"):
+            self._set_status("Error: %s" % summary["error"])
+            return
+        if summary.get("cancelled"):
+            self.progress.set(summary.get("done_files", 0)
+                              / max(1, summary.get("total_files", 1)))
+            self._set_status(
+                "Cancelled at %d/%d files. Manifest saved \u2014 use "
+                "'Resume backup...' to finish." % (summary.get("done_files", 0),
+                                                   summary.get("total_files", 0)))
+            return
+        self.progress.set(1.0)
+        rate = _human_bytes(summary.get("rate_bps", 0))
+        self._set_status(
+            "Done: %d/%d files, %s in %.1fs (%s/s). Errors: %d"
+            % (summary.get("done_files", 0), summary.get("total_files", 0),
+               _human_bytes(summary.get("moved_bytes", 0)),
+               summary.get("elapsed_s", 0), rate, summary.get("errors", 0)))
+        try:
+            self.master_app._log_ui(
+                "Backup complete: %d files to %s"
+                % (summary.get("done_files", 0), summary.get("dest_root", "")))
+        except Exception:
+            pass
+
+    # -- progress / status plumbing -------------------------------------
+    def _bg_status(self, msg):
+        self.after(0, lambda: self._set_status(msg))
+
+    def _bg_progress(self, d):
+        self.after(0, lambda: self._apply_progress(d))
+
+    def _apply_progress(self, d):
+        pct = d.get("percent", 0) / 100.0
+        try:
+            self.progress.set(max(0.0, min(1.0, pct)))
+        except Exception:
+            pass
+        eta = _human_eta(d.get("eta_s"))
+        rate = _human_bytes(d.get("rate_bps", 0))
+        df = d.get("done_files")
+        tf = d.get("total_files")
+        head = ("%d/%d" % (df, tf)) if df is not None else "copying"
+        self._set_status(
+            "%s  |  %s / %s  |  %s/s  |  ETA %s  |  %s"
+            % (head, _human_bytes(d.get("done_bytes", 0)),
+               _human_bytes(d.get("total_bytes", 0)), rate, eta,
+               (d.get("file") or "")[:40]))
+
+    def _set_status(self, msg):
+        try:
+            self.prog_label.configure(text=msg)
+        except Exception:
+            pass
+
+    def _set_buttons_running(self, running):
+        self.btn_start.configure(state="disabled" if running else "normal")
+        self.btn_cancel.configure(state="normal" if running else "disabled")
+        self.btn_resume.configure(state="disabled" if running else "normal")
+
+    def _on_close(self):
+        if self._busy:
+            if not messagebox.askyesno(
+                    "Close?", "A transfer is running. Cancel it and close?"):
+                return
+            self.engine.cancel()
+        self.destroy()
+
+
 # ----------------------------------------------------------------------------
 # Entry point
 # ----------------------------------------------------------------------------
 def main():
     debug = "--debug" in sys.argv
     logger = Logger(debug=debug)
+    _load_vendor_overrides()  # merge optional external usb_ids.json
     logger.event(
         "INFO",
         "launch",

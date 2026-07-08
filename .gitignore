@@ -8,6 +8,10 @@ usb_c_tester_config.json
 usb_c_tester_history.csv
 *.tmp
 
+# Backup output (per-run logs + resumable manifests)
+backups/
+manifest_*.json
+
 # PyInstaller
 build/
 dist/

@@ -22,11 +22,11 @@ Some devices — including the **Autel KM100** and **Rockchip-based tools** (VID
 - **PTP/camera mode** (no browsable storage) → amber: the cable works, but switch the device to **MTP / File Transfer** mode for file access.
 - Because MTP has no drive letter, the speed test uses a **copy-based benchmark** — it times a real file **push (write)** to the device and **pull (read)** back through Explorer's WPD copy engine, reporting the practical MTP transfer rate.
 - **Writable-folder targeting with multi-candidate fallback.** Android/Autel MTP roots usually reject top-level writes, and the storage node's name is padded with invisible bidirectional marks that break name matching. The benchmark descends into the storage tree **by folder structure (not by name)** and then **tries each standard user folder in turn** — **Download → Downloads → Pictures → DCIM → Music → Movies → Documents**, then the storage root — until one **actually accepts** the write (verified by re-listing, not just an API call). The folder that succeeded is shown in the log as the **target folder**; each folder gets a fair slice of the time budget so a stubborn one can't starve the fallback.
-- **Read-only fallback picks the best file.** If every folder refuses writes, the benchmark scans the device for an existing file and measures a **pull-only (read)** throughput instead. It deliberately prefers the **largest file in a 1–128 MB band** rather than the first file it sees, because tiny files (like a `.config`) copy faster than the timer can resolve and would report a bogus 0 MB/s. This is reported as green **"Data OK (MTP, read-only)"** and never deletes your files (only the app's own pushed test file is cleaned up).
-- **Read timing hardened.** The pull waits on a fine (50 ms) poll for the local copy's size to **stabilise** or reach the expected size, so even quick copies get an accurate elapsed time.
+- **Read-only fallback that trusts bytes, not the reported size.** If every folder refuses writes, the benchmark measures a **pull-only (read)** throughput from an existing file. MTP frequently **reports `Size = 0` for real, multi-megabyte files**, which previously fooled the app into grabbing a tiny `.config` and reporting a bogus 0 MB/s. The fallback now **collects many candidate files across the whole device tree** (ranking reported-in-band files first, then unknown `Size = 0` files, then the rest) and **actually pulls them one by one**, measuring the **real bytes that land on disk**, until one yields at least **0.5 MB** — enough to time reliably. It never trusts the bogus reported size. This is reported as green **"Data OK (MTP, read-only)"** and never deletes your files (only the app's own pushed test file is cleaned up).
+- **Read timing hardened.** Each pull waits on a fine (50 ms) poll for the local copy's size to **stabilise** or reach its target, with a per-file cap so one stuck file can't eat the whole time budget, so even quick copies get an accurate elapsed time.
 - **Honest verdicts, never a false red.**
   - Write refused but a real read measured → green **"Data OK (MTP, read-only)"** with the read speed.
-  - Data moved but the only available file was too small to time → green **"Data OK (MTP, confirmed)"** with an informational note (speed not measurable).
+  - Data moved but every readable file was under the 0.5 MB measurable floor → green **"Data OK (MTP, confirmed)"** with an honest note that the data path is confirmed but the speed wasn't measurable (no invented numbers).
   - Only if the device refuses writes **and** exposes no readable file at all does it show an **amber, informational** "not measurable" result — still stating the **cable is confirmed data-capable**, not a red failure.
 - MTP transfer is inherently slower than raw mass storage; the Speed Grade tile does **not** flag a low MTP rate as a bad cable.
 
@@ -39,7 +39,7 @@ Some devices — including the **Autel KM100** and **Rockchip-based tools** (VID
 
 ### Detection & accuracy
 - Per-port USB **generation label** (USB 2.0 / 3.x / 3.2 Gen2 / USB4·Thunderbolt) via WMI
-- **Far-end device readout**: name + VID/PID
+- **Far-end device readout**: name + VID/PID, with a **human-readable vendor name** resolved from the VID (built-in table covers Rockchip `2207`, the common Autel VIDs, and ~45 other vendors). Drop a `usb_ids.json` next to the app to add or override vendor names.
 - Best-effort **USB-PD voltage** readout
 - Explicit **inconclusive/confidence** state
 
@@ -48,6 +48,18 @@ Some devices — including the **Autel KM100** and **Rockchip-based tools** (VID
 - Warm-up pass + **average of 3 runs** (min/avg/max)
 - **Auto-scales** test file to free space, **capped ~10s** so it never hangs
 - Flags **throttling anomaly** if mid-test speed drops >20%
+- **Size sweep** (mass storage) — runs the benchmark across **4 / 16 / 64 / 256 MB** transfers and renders a **throughput-vs-size chart** (PNG in `logs/`) so you can see how the cable scales with transfer size.
+- **Save Report** — exports a one-page **report card PNG** with the verdict (PASS/FAIL), generation, and measured speeds for record-keeping or sharing.
+
+### Device Browser & Backup
+A **Browse / Backup** window (enabled whenever a mass-storage or MTP device is selected) lets you explore and copy the connected device's filesystem:
+- **Full recursive scan** of the device tree — **mass storage** (real drive letter, via `os.scandir`) **and MTP** (via the WPD shell namespace), with per-entry sizes. A **Recurse into subfolders** toggle controls whether the scan descends the whole tree or lists only the top level.
+- **Checkbox tree** — check individual files or whole folders (a folder check cascades to its children); **Select all** / **Clear** helpers and a live "N files selected (size)" readout.
+- **Two directions** — **Device → PC (backup)** pulls the checked items to a destination folder you choose, preserving the folder structure; **PC → Device (restore)** copies a chosen PC folder back to the device.
+- **Live progress with ETA** — a progress bar plus a status line showing files done, bytes moved / total, transfer rate, **estimated time remaining**, and the current file.
+- **Resumable backups** — every backup writes a JSON **manifest** (`backups/manifest_*.json`) and marks each file done as it completes. If a transfer is interrupted (cancel, unplug, crash), click **Resume backup...**, pick the manifest, and it **skips already-copied files** and finishes the rest. A fully completed backup removes its own manifest.
+- **Persistent backup logs** — each run appends a timestamped log to `backups/backup_*.log` (start, per-file OK/ERR, and a final summary), separate from the app's main `logs/`.
+- All scanning and copying run on a **worker thread** so the UI stays responsive; MTP work opens its own COM apartment on that thread.
 
 ### Device selection
 - **Target device picker** — a dropdown lists every connected USB-C device (removable USB storage volumes + MTP/PTP portable devices like the KM100). Pick which one to inspect/benchmark; the tiles, banner, and benchmark target all follow your selection.
@@ -68,6 +80,7 @@ Some devices — including the **Autel KM100** and **Rockchip-based tools** (VID
 - Captures startup env, global `sys.excepthook` tracebacks, thread exceptions, and all detection/benchmark events
 - `--debug` flag echoes log lines to stdout
 - Timestamps in **America/Chicago** (MM-DD-YY, HH:MM AM/PM)
+- **Backup activity** is logged separately under `backups/` (per-run `.log` + resumable `.json` manifests)
 
 ## Requirements
 
@@ -103,8 +116,9 @@ A **GitHub Actions** workflow (`.github/workflows/build.yml`) auto-builds `dist/
 1. Launch the app (run as admin for full WMI USB event access).
 2. Plug a USB-C cable with a **data device** on the far end — the app **auto-detects the connection** (banner flashes green + chime) and **auto-detects removal** (banner flashes red).
 3. Watch the tiles: green = data-capable, red = charge-only, amber = inconclusive.
-4. Click **Run Benchmark** to measure read/write speed.
-5. Use **Batch Mode** to test multiple cables in sequence; **Export CSV** for records.
+4. Click **Run Benchmark** to measure read/write speed (or **Size Sweep** on mass storage for a throughput-vs-size chart, then **Save Report** for a one-page PNG).
+5. Click **Browse / Backup** to explore the device's files, check what you want, and back it up to your PC (or restore a PC folder to the device) with live ETA and resumable transfers.
+6. Use **Batch Mode** to test multiple cables in sequence; **Export CSV** for records.
 
 ## Notes / limitations
 
